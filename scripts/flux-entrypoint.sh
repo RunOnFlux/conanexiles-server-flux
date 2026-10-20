@@ -51,6 +51,9 @@ conan() { python3 /opt/flux/fluxconan.py "$@"; }
 rm -f "${FLUX_RESTART_MARKER}"
 mkdir -p "${s}" "${d}" "${FLUX_SAVED_DIR}" "${FLUX_STATE_DIR}" "${FLUX_STATE_DIR}/import" "${FLUX_GAME_LOG_DIR}" \
   "${FLUX_LOCAL_DIR}/crashes" "${FLUX_LOCAL_DIR}/extracted-mods"
+# An older image kept flux.log on the synced data volume: move it here, once.
+flux_log_migrate "${FLUX_STATE_DIR}/flux.log"
+flux_banner "Conan Exiles"
 
 ports_ok=1
 port="$(flux_valid_port "${CONAN_PORT:-7777}")" || ports_ok=0
@@ -365,6 +368,7 @@ start_generation() {
   [ "${terminating}" = "1" ] && return 2
 
   conan state starting "Loading the world"
+  flux_banner "Conan Exiles"
   flux_log "starting the server (generation ${generation}): ${args[*]//-ServerPassword=*/-ServerPassword=***}"
 
   # The game's log onto the container's output, without the start-up noise.

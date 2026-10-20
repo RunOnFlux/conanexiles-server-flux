@@ -24,8 +24,8 @@ under a supervisor that:
 
 | Path | Flux mount | What |
 |---|---|---|
-| `/mnt/conan/data` | `g:` (synced) | `Saved/` (`game_0.db` the world, `Config/LinuxServer/*.ini`; the install's `ConanSandbox/Saved` is a link to it) and `flux/` (our log, state, rcon password, mods list, backups) |
-| `/mnt/conan/server` | `ml:server` (local) | the game install, 4.2 GB, the Workshop downloads, `flux-local/` (game logs, crash dumps, extracted mods) |
+| `/mnt/conan/data` | `g:` (synced) | `Saved/` (`game_0.db` the world, `Config/LinuxServer/*.ini`; the install's `ConanSandbox/Saved` is a link to it) and `flux/` (state, rcon password, mods list, backups) |
+| `/mnt/conan/server` | `ml:server` (local) | the game install, 4.2 GB, the Workshop downloads, `flux-local/` (game logs, crash dumps, extracted mods) Also `flux-logs/flux.log` (our supervisor log, 5 MB then one `.1`): local, never synced. |
 
 Spec: `g:/mnt/conan/data|ml:server:/mnt/conan/server`.
 
@@ -81,3 +81,4 @@ idle RAM 8.6 GiB all regions / 4.9 GiB Exiled Lands, CPU ~20 % of a core idle.
 ## Versions
 
 - **1.0.0** (2026-10-19): first release.
+- **1.0.1** (2026-10-20): `flux.log` moved off the synced data volume to `/mnt/conan/server/flux-logs/flux.log` (5 MB, one `.1`; an old one is moved there once); start-up banner; the weekly rebuild only when it has something to apply.
