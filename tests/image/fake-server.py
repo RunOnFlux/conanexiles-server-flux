@@ -6,7 +6,8 @@ Behaves like the real server where the supervisor cares (build 25792439, measure
   - logs ProjectVersion, then "Started SourceServerQueries on port <QueryPort>", then a
     "LogServerStats: Status report. ... Players=0 ..." line every few seconds
   - reads RCON's port and password from Saved/Config/LinuxServer/Game.ini and answers Source RCON:
-    listplayers (empty), broadcast, help; replies arrive a moment later, as the game's do
+    listplayers (empty), broadcast, help, banplayer (of an offline player: "No player with
+    platform ID"); replies arrive a moment later, as the game's do
   - SIGINT / SIGTERM: "Engine exit requested", then exits 130 / 143 after a short teardown
   - "crash" over RCON: exits 139 at once
 """
@@ -103,6 +104,9 @@ def client(conn):
                 print(f"LogRcon: broadcast: {body[10:]}", flush=True)
             elif body.startswith("sql pragma wal_checkpoint"):
                 reply = "   busy |  log |  checkpointed |\n#0    0 |    0 |             0 |\n"
+            elif body.startswith("banplayer platformid "):
+                # Measured: an offline player cannot be banned over RCON.
+                reply = f"No player with platform ID {body.split()[2]}."
             elif body == "help":
                 reply = "Commands:\n\tlistplayers\n\tbroadcast\n"
             else:

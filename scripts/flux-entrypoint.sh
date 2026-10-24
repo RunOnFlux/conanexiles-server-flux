@@ -4,8 +4,9 @@
 # The game runs as a CHILD, never exec, so a stop reaches us first and becomes a clean shutdown,
 # and a server that ends on its own is followed by the next one in place:
 #
-#   - every start: SteamCMD update, the mods list downloaded from the Workshop (modlist.txt in its
-#     order), a pending restore / new world / uploaded world applied, a backup of the world, Game.ini,
+#   - every start: SteamCMD update, a pending restore / new world / uploaded world applied and the
+#     world guard (no new world over a missing one this server had), the mods list downloaded from
+#     the Workshop (modlist.txt in its order), a backup of the world, Game.ini,
 #     Engine.ini and the image's keys of ServerSettings.ini from the environment (fluxconan.py apply,
 #     whose output is the launch arguments), then the server, as an unprivileged user (Unreal
 #     refuses root)
@@ -40,6 +41,12 @@ FLUX_CHECKPOINT_MINUTES="${FLUX_CHECKPOINT_MINUTES:-5}"
 FLUX_BACKUP_HOURS="${FLUX_BACKUP_HOURS:-6}"
 export FLUX_BACKUP_KEEP="${FLUX_BACKUP_KEEP:-10}"
 FLUX_UPDATE_CHECK_MINUTES="${FLUX_UPDATE_CHECK_MINUTES:-30}"
+# Workshop mod updates: how often Steam is asked whether a listed mod has a newer version (0 = off).
+FLUX_MOD_CHECK_MINUTES="${FLUX_MOD_CHECK_MINUTES:-30}"
+# Deadlines for SteamCMD: a node that cannot reach Steam must not hang a start or the watcher.
+FLUX_STEAMCMD_TIMEOUT="${FLUX_STEAMCMD_TIMEOUT:-1800}"
+FLUX_STEAMCMD_UPDATE_TIMEOUT="${FLUX_STEAMCMD_UPDATE_TIMEOUT:-600}"
+FLUX_STEAMCMD_QUERY_TIMEOUT="${FLUX_STEAMCMD_QUERY_TIMEOUT:-180}"
 # Warnings in chat before a planned restart (a game update or the daily one), in minutes.
 FLUX_RESTART_WARN_MINUTES="${FLUX_RESTART_WARN_MINUTES:-15 5 1}"
 FLUX_STOP_SIGNAL="${FLUX_STOP_SIGNAL:-INT}"
@@ -78,6 +85,7 @@ flux_log "flux-entrypoint starting (image ${FLUX_IMAGE_VERSION:-dev}): game UDP 
 game_pid=""
 tail_pid=""
 watch_pid=""
+ckpt_pid=""
 backup_pid=""
 cap_pid=""
 terminating=0
@@ -120,8 +128,29 @@ term_handler() {
 }
 trap term_handler TERM INT
 
+# One SteamCMD run with a deadline, in the background so a stop is not held up by it (bash runs
+# a trap only between foreground commands). $1 = seconds, the rest = SteamCMD's arguments.
+# Returns 124 on the deadline, 143 when the container is stopping.
+steamcmd_run() {
+  local limit="$1" pid rc
+  shift
+  timeout -k 10 "${limit}" steamcmd "$@" >/tmp/steamcmd.log 2>&1 &
+  pid=$!
+  wait "${pid}"
+  rc=$?
+  if [ "${terminating}" = "1" ]; then
+    kill "${pid}" 2>/dev/null
+    pkill -f 'steamcmd' 2>/dev/null
+    return 143
+  fi
+  return "${rc}"
+}
+
+# Every SteamCMD run has a deadline (FLUX_STEAMCMD_TIMEOUT, 30 min, for a first install;
+# FLUX_STEAMCMD_UPDATE_TIMEOUT, 10 min, over an install): a node that cannot reach Steam's CDN
+# must not stay "updating" for ever.
 update_server() {
-  local attempt validate
+  local attempt validate limit rc why
   if flux_truthy "${SKIP_UPDATE:-}" && [ -x "${s}/ConanSandbox/Binaries/Linux/${FLUX_GAME_PROCESS}" ]; then
     flux_log "SKIP_UPDATE is set: not updating the server files"
     return 0
@@ -132,26 +161,26 @@ update_server() {
   # install fails the first attempt, and every retry validates.
   validate=""
   for attempt in 1 2 3 4 5; do
+    limit="${FLUX_STEAMCMD_TIMEOUT}"
+    [ -x "${s}/ConanSandbox/Binaries/Linux/${FLUX_GAME_PROCESS}" ] && limit="${FLUX_STEAMCMD_UPDATE_TIMEOUT}"
     # app_info_update + a second app_update: SteamCMD answers "Missing configuration" to a first
-    # app_update now and then. In the background and waited for, so a `docker stop` during a
-    # download reaches the trap at once.
+    # app_update now and then.
     # shellcheck disable=SC2086  # validate is "" or "validate"
-    steamcmd +@sSteamCmdForcePlatformType linux +force_install_dir "${s}" +login anonymous +app_info_update 1 \
-      +app_update "${FLUX_STEAM_APP}" +app_update "${FLUX_STEAM_APP}" ${validate} +quit >/tmp/steamcmd.log 2>&1 &
-    local steam_pid=$!
-    wait "${steam_pid}"
-    local rc=$?
-    if [ "${terminating}" = "1" ]; then
-      kill "${steam_pid}" 2>/dev/null
-      return 1
-    fi
+    steamcmd_run "${limit}" +@sSteamCmdForcePlatformType linux +force_install_dir "${s}" +login anonymous +app_info_update 1 \
+      +app_update "${FLUX_STEAM_APP}" +app_update "${FLUX_STEAM_APP}" ${validate} +quit
+    rc=$?
+    [ "${terminating}" = "1" ] && return 1
     if [ "${rc}" = "0" ]; then
       flux_log "server build $(flux_installed_build "${s}/steamapps/appmanifest_${FLUX_STEAM_APP}.acf")"
       return 0
     fi
     validate="validate"
-    flux_log "WARN steamcmd failed (attempt ${attempt}/5): $(grep -aE 'ERROR|Error|error' /tmp/steamcmd.log | tail -2 | tr '\n' ' ')retrying in 5s with validate"
-    sleep 5
+    why="$(grep -aE 'ERROR|Error|error' /tmp/steamcmd.log | tail -2 | tr '\n' ' ')"
+    [ "${rc}" = "124" ] && why="no answer within ${limit} s (Steam unreachable from this node?) ${why}"
+    flux_log "WARN steamcmd failed (attempt ${attempt}/5): ${why}retrying in 5s with validate"
+    sleep 5 &
+    wait $!
+    [ "${terminating}" = "1" ] && return 1
   done
   if [ -x "${s}/ConanSandbox/Binaries/Linux/${FLUX_GAME_PROCESS}" ]; then
     flux_log "WARN could not update from Steam; starting the build already installed"
@@ -243,13 +272,29 @@ warn_and_wait() {
 }
 
 # shellcheck disable=SC2329  # run in the background below
+# The world file whole every FLUX_CHECKPOINT_MINUTES (the game's WAL is checkpointed and truncated
+# through RCON), so what Syncthing copies to another node is a consistent database, not half of a
+# WAL pair. A loop of its own: the watcher's waits (Steam, the warnings before a restart) never
+# hold it up.
+checkpointer() {
+  [ "${FLUX_CHECKPOINT_MINUTES}" -gt 0 ] 2>/dev/null || exit 0
+  while true; do
+    sleep $((FLUX_CHECKPOINT_MINUTES * 60))
+    timeout 5 python3 /opt/flux/fluxconan.py rcon "sql pragma wal_checkpoint(TRUNCATE)" >/dev/null 2>&1
+  done
+}
+
+# shellcheck disable=SC2329  # run in the background below
 # Marks the server running once the Steam query has started, keeps the player count from the
-# per-minute status line, follows Steam for a newer build and keeps the daily restart.
+# per-minute status line, follows Steam for a newer build and newer Workshop mods, and keeps the
+# daily restart.
 watcher() {
-  local line build public last_check last_ckpt now next_restart="" n
+  local line build public last_check last_mods now next_restart="" n mods
   last_check="$(date -u +%s)"
+  last_mods="${last_check}"
   while IFS= read -r line; do
     if [[ "${line}" == *"Started SourceServerQueries"* ]]; then
+      conan world-seen
       conan state running
       printf '0' >/tmp/flux-players
       flux_log "the server is up (generation ${generation})"
@@ -263,31 +308,38 @@ watcher() {
     conan note nextRestart
   fi
   conan note updateWaiting
+  conan note modUpdateWaiting
   # The per-minute status line carries the player count.
   (tail -n 0 -F "$(flux_game_log)" 2>/dev/null | while IFS= read -r line; do
     n="$(flux_players_from_stats "${line}")"
     [ -n "${n}" ] && printf '%s' "${n}" >/tmp/flux-players
   done) &
-  last_ckpt="$(date -u +%s)"
   while true; do
     sleep 60
     now="$(date -u +%s)"
-    # The world file whole every few minutes (the game's WAL is checkpointed and truncated), so what
-    # Syncthing copies to another node is a consistent database, not half of a WAL pair.
-    if [ "${FLUX_CHECKPOINT_MINUTES}" -gt 0 ] 2>/dev/null && [ $((now - last_ckpt)) -ge $((FLUX_CHECKPOINT_MINUTES * 60)) ]; then
-      last_ckpt="${now}"
-      timeout 5 python3 /opt/flux/fluxconan.py rcon "sql pragma wal_checkpoint(TRUNCATE)" >/dev/null 2>&1
-    fi
     if [ "${FLUX_UPDATE_CHECK_MINUTES}" -gt 0 ] 2>/dev/null && [ $((now - last_check)) -ge $((FLUX_UPDATE_CHECK_MINUTES * 60)) ]; then
       last_check="${now}"
       build="$(flux_installed_build "${s}/steamapps/appmanifest_${FLUX_STEAM_APP}.acf")"
-      public="$(steamcmd +login anonymous +app_info_update 1 +app_info_print "${FLUX_STEAM_APP}" +quit 2>/dev/null | flux_public_build)"
+      # A deadline: a SteamCMD that never answers would end the update checks and the daily
+      # restart for the whole generation.
+      public="$(timeout -k 10 "${FLUX_STEAMCMD_QUERY_TIMEOUT}" steamcmd +login anonymous +app_info_update 1 +app_info_print "${FLUX_STEAM_APP}" +quit 2>/dev/null | flux_public_build)"
       if [ -n "${public}" ] && [ -n "${build}" ] && [ "${public}" != "${build}" ] && ! conan update-skip "${public}"; then
         flux_log "a new server build is on Steam (${build} -> ${public}): restarting onto it"
         conan note updateWaiting "${public}"
         warn_and_wait "game update"
         conan update-target "${public}"
         request_restart "planned: game update ${build} -> ${public}"
+        exit 0
+      fi
+    fi
+    # A Workshop mod with a newer version on Steam: the players' clients already have it and the
+    # server refuses them until it restarts and downloads it (mods-sync).
+    if [ "${FLUX_MOD_CHECK_MINUTES}" -gt 0 ] 2>/dev/null && [ $((now - last_mods)) -ge $((FLUX_MOD_CHECK_MINUTES * 60)) ]; then
+      last_mods="${now}"
+      if mods="$(timeout -k 5 60 python3 /opt/flux/fluxconan.py mods-update-check 2>/dev/null)" && [ -n "${mods}" ]; then
+        flux_log "a newer version of Workshop mod(s) ${mods} is on Steam: restarting onto it"
+        warn_and_wait "mod update"
+        request_restart "planned: mod update (${mods})"
         exit 0
       fi
     fi
@@ -321,20 +373,59 @@ log_capper() {
 # movement modes): kept in the log file, left out of the container's output (the panel's Console).
 FLUX_LOG_NOISE='UDataTable::FindRow|is in an unsafe movement move|SpawnNPCFromWeightedTable|Removing placed module that did not manage|TickSpawnBase - Failed to spawn module|ThrallActorClass was not loaded|LogBlueprintUserMessages: \[BP_OuterDarkArenaController'
 
+# Before every start: a restore / import / new world the panel asked for, then the world guard
+# (fluxconan.py world-guard): never start the game on a missing world this server had, which on a
+# half-synced volume would make a new world and sync it over the real one. A restore from a backup
+# is said in flux.log and the state; while it waits (for the sync, or with no backup for ever) the
+# state is `updating` with the reason, checked every 30 s (the panel may ask for a restore or a new
+# world meanwhile). Returns 1 when stopping.
+guard_world() {
+  local line out rc said=""
+  while true; do
+    while IFS= read -r line; do
+      flux_log "restore: ${line#\# }"
+      case "${line}" in
+        *"NOT done"* | *"failed ("*) world_note="${line#\# WARN }" ;;
+      esac
+    done < <(conan do-restore 2>&1)
+    out="$(conan world-guard 2>&1)"
+    rc=$?
+    while IFS= read -r line; do
+      [ -n "${line}" ] && [[ "${line}" == "# "* ]] && flux_log "world: ${line#\# }"
+    done <<<"${out}"
+    if [ "${rc}" = "0" ]; then
+      line="$(grep -o 'restored the newest backup, [^ ,]*' <<<"${out}" | head -1)"
+      [ -n "${line}" ] && world_note="the world was missing on this node: backup ${line#restored the newest backup, } put back"
+      return 0
+    fi
+    line="$(grep -v '^# ' <<<"${out}" | tail -1)"
+    if [ "${said}" != "${line}" ]; then
+      flux_log "WARN ${line}"
+      said="${line}"
+    fi
+    conan state updating "${line}"
+    sleep 30 &
+    wait $!
+    [ "${terminating}" = "1" ] && return 1
+  done
+}
+
 start_generation() {
   local line args=() current applied
   generation=$((generation + 1))
   rm -f "${FLUX_RESTART_MARKER}" /tmp/flux-players
+  world_note=""
 
   update_server || return 1
   while IFS= read -r line; do flux_log "${line#\# }"; done < <(conan update-check 2>&1)
   [ "${terminating}" = "1" ] && return 2
   link_saved
+  # A restore, a new world or an uploaded world the panel asked for, and the world guard, before
+  # anything reads them: the mods list is the restored one when mods-sync runs.
+  guard_world || return 2
   conan state starting "Downloading mods"
   while IFS= read -r line; do flux_log "${line#\# }"; done < <(conan mods-sync 2>&1)
   [ "${terminating}" = "1" ] && return 2
-  # A restore, a new world or an uploaded world the panel asked for, before anything reads them.
-  while IFS= read -r line; do flux_log "restore: ${line#\# }"; done < <(conan do-restore 2>&1)
   backup_world "start"
 
   # apply's stdout is the arguments (and "# " notes). A failed apply starts the server on the
@@ -367,12 +458,14 @@ start_generation() {
   flux_prune "${FLUX_GAME_LOG_DIR}" '*-server.log' "${FLUX_GAME_LOG_KEEP}"
   [ "${terminating}" = "1" ] && return 2
 
-  conan state starting "Loading the world"
+  conan state starting "Loading the world${world_note:+ (${world_note})}"
   flux_banner "Conan Exiles"
-  flux_log "starting the server (generation ${generation}): ${args[*]//-ServerPassword=*/-ServerPassword=***}"
+  # flux_log hides the join password (flux_log_filter).
+  flux_log "starting the server (generation ${generation}): ${args[*]}"
 
-  # The game's log onto the container's output, without the start-up noise.
-  (tail -n 0 -F "${current}" 2>/dev/null | grep --line-buffered -avE "${FLUX_LOG_NOISE}" | sed -u 's/\x0//g') &
+  # The game's log onto the container's output, without the start-up noise. flux_log_filter: no
+  # NUL bytes, and the join password on the game's "Command Line:" line hidden.
+  (tail -n 0 -F "${current}" 2>/dev/null | grep --line-buffered -avE "${FLUX_LOG_NOISE}" | flux_log_filter) &
   tail_pid=$!
 
   (
@@ -387,6 +480,8 @@ start_generation() {
 
   watcher &
   watch_pid=$!
+  checkpointer &
+  ckpt_pid=$!
   backupper &
   backup_pid=$!
   log_capper &
@@ -396,11 +491,11 @@ start_generation() {
 
 sweep_generation() {
   local pid
-  for pid in "${tail_pid}" "${watch_pid}" "${backup_pid}" "${cap_pid}"; do
+  for pid in "${tail_pid}" "${watch_pid}" "${ckpt_pid}" "${backup_pid}" "${cap_pid}"; do
     [ -n "${pid}" ] && pkill -P "${pid}" 2>/dev/null
     [ -n "${pid}" ] && kill "${pid}" 2>/dev/null
   done
-  tail_pid="" watch_pid="" backup_pid="" cap_pid=""
+  tail_pid="" watch_pid="" ckpt_pid="" backup_pid="" cap_pid=""
   pkill -f "tail -n [0+1]* -F $(flux_game_log)" 2>/dev/null
   pkill -KILL -x "${FLUX_GAME_COMM}" 2>/dev/null
   game_pid=""

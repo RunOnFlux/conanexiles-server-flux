@@ -27,9 +27,9 @@ A change to what the image does bumps `VERSION` and gets a line under "Versions"
 ## The files
 
 - `scripts/flux-entrypoint.sh`: PID 1. Per generation: SteamCMD update, Saved/ linked to the data
-  volume, mods from the Workshop, a pending restore / new world, a backup, `fluxconan.py apply`
-  (ini files + launch args on stdout), the server, then the watcher (ready, updates, daily restart,
-  checkpoints), the backupper and the log capper.
+  volume, a pending restore / new world and the world guard, mods from the Workshop, a backup,
+  `fluxconan.py apply` (ini files + launch args on stdout), the server, then the watcher (ready,
+  game and mod updates, daily restart), the checkpointer, the backupper and the log capper.
 - `scripts/fluxconan.py`: every decision about the server's files and the hub's commands
   (`flux-conan ...`), incl. the RCON client. The one place those rules live.
 - `scripts/flux-lib.sh`: shared helpers; **sourcing it must stay side-effect free** (tests source it).
@@ -51,6 +51,20 @@ A change to what the image does bumps `VERSION` and gets a line under "Versions"
 - **UE4 mods do not load on Enhanced.** Only Enhanced-built Workshop items.
 - **Map regions:** `exiled-lands` saves ~3.7 GB RAM.
 - **Backups copy the SQLite world with its online-backup API**, never the loose file (WAL).
+- **The world guard** (`fluxconan.py world-guard`, `guard_world` in the entrypoint): a node can
+  start on a `g:` volume whose `game_0.db` has not arrived; the game would make an empty world and
+  Syncthing would copy it over the real one. With evidence of a world (`flux/worlds.json` "seen",
+  written by `world-seen` when the server is up; any backup; the game's `game_0_backup_N.db`) and
+  no `game_0.db`, it waits `FLUX_WORLD_SYNC_GRACE_SECONDS` (state `updating`) then puts the newest
+  backup back. A panel `new-world` writes `{"newWorld"}` there BEFORE removing the world, so the
+  guard lets that one through. `do-restore` runs inside the guard loop and BEFORE `mods-sync`; its
+  request is removed only when done, so a stop mid-way runs it again. Tests set the grace to 0.
+- **RCON karma** (`RconMaxKarma`): at 60, ~14 one-shot connections in 15 s from 127.0.0.1 got every
+  connection denied for minutes (accepted, then closed at once). The image writes 100000
+  (`CONAN_RCON_MAX_KARMA`); `rcon()` turns the drop into `RconRefused`, one line, exit 3.
+- **Offline bans are not RCON's**: `banplayer platformid` needs the player online, and
+  `Saved/blacklist.txt` is read only at start. `ban` queues in `flux/bans-pending.json`; `apply`
+  writes the queue into the file.
 - **Empty env = unset.** **Flux stops a container with Docker's default 10 seconds.**
 - The game's stdout is not reliable at exit; its log file is. The version string in the log ends
   with a dot ("3.0.1.").

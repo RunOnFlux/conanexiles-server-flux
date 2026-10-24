@@ -63,12 +63,15 @@ STUB
 chmod +x /usr/local/bin/steamcmd
 
 export FLUX_SERVER_DIR=/tmp/srv FLUX_DATA_DIR=/tmp/data FLUX_RESTART_BACKOFF=1 FLUX_STOP_GRACE=20
-CONAN_SERVER_NAME='Test "Server"' CONAN_ADMIN_PASSWORD=boss123 CONAN_PORT=40000 CONAN_QUERY_PORT=40002 CONAN_RCON_PORT=40003 \
+CONAN_SERVER_NAME='Test "Server"' CONAN_ADMIN_PASSWORD=boss123 CONAN_SERVER_PASSWORD=joinsecret1 CONAN_PORT=40000 CONAN_QUERY_PORT=40002 CONAN_RCON_PORT=40003 \
   CONAN_MODS="111111, 222222" /opt/flux/flux-entrypoint.sh >/tmp/sup.log 2>&1 &
 sup=$!
 check "the server comes up and is marked running" "0" "$(status wait_for "grep -q 'the server is up (generation 1)' /tmp/sup.log" 30)"
 check "it runs as uid 1000, not root" "1000" "$(ps -o uid= -p "$(pgrep -x ConanSandboxSer)" | tr -d ' ')"
-check "the launch line carries the rolled ports and the name without quotes" "0" "$(status grep -q 'Command Line: ConanSandbox -log -Port=40000 -QueryPort=40002 -MaxPlayers=40 -ServerName=Test Server' /tmp/sup.log)"
+check "the launch line carries the rolled ports and the name without quotes" "0" "$(status grep -q 'Command Line: ConanSandbox -log -Port=40000 -QueryPort=40002 -MaxPlayers=40 -ServerName=Test Server -ServerPassword=<hidden>' /tmp/sup.log)"
+check "the join password is never in the container output" "0" "$(grep -c joinsecret1 /tmp/sup.log)"
+check "nor in flux.log" "0" "$(grep -c joinsecret1 /tmp/srv/flux-logs/flux.log)"
+check "the RCON karma limit is high" "100000" "$(sed -n 's/^RconMaxKarma=//p' /tmp/data/Saved/Config/LinuxServer/Game.ini)"
 check "Saved is the data volume" "/tmp/data/Saved" "$(readlink /tmp/srv/ConanSandbox/Saved)"
 check "the game's logs are local" "/tmp/srv/flux-local/logs-game" "$(readlink /tmp/data/Saved/Logs)"
 check "RCON answers through flux-conan" "0" "$(status bash -c 'flux-conan rcon help | grep -q listplayers')"
@@ -86,11 +89,15 @@ check "the start-up noise stays out of the container output" "0" "$(grep -c 'Fin
 
 # The panel's restart: a marker; the server is stopped, mods re-applied, a new generation.
 flux-conan set-mods '["222222"]' >/dev/null
+check "a ban of an offline player is queued, no restart" "False True" "$(flux-conan ban 76561198000000005 griefing | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["online"],d["pending"])')"
+check "the restart is not done for it" "1" "$(status test -e /tmp/flux-restart-requested)"
 check "a restart is accepted" "True" "$(flux-conan restart | jget ok)"
 check "the next generation comes up" "0" "$(status wait_for "grep -q 'the server is up (generation 2)' /tmp/sup.log" 30)"
 check "the server got SIGINT (a clean shutdown)" "0" "$(status grep -q 'Engine exit requested' /tmp/sup.log)"
 check "a requested restart is not a crash" "0" "$(grep -c 'restarts within' /tmp/sup.log)"
 check "the new mods list is applied" "*222222/Mod222222.pak" "$(cat /tmp/srv/ConanSandbox/Mods/modlist.txt)"
+check "the queued ban is in blacklist.txt at the next start, owned by the server's user" "76561198000000005 1000" "$(cat /tmp/data/Saved/blacklist.txt) $(stat -c %u /tmp/data/Saved/blacklist.txt)"
+check "and no longer queued" "[]" "$(flux-conan bans | jget pending)"
 check "the dropped mod's link is gone" "1" "$(status test -L /tmp/srv/ConanSandbox/Mods/111111)"
 
 # A restore: pending, applied between two servers, after a safety backup.
@@ -135,6 +142,27 @@ check "the server was ended, not waited for" "0" "$(status grep -q 'stopped on r
 check "nothing is left running" "1" "$(status pgrep -x ConanSandboxSer)"
 check "the state says stopped" "stopped" "$(flux-conan status | jget state)"
 check "the world database is intact" "ok" "$(python3 -c "import sqlite3;print(sqlite3.connect('/tmp/data/Saved/game_0.db').execute('pragma integrity_check').fetchone()[0])")"
+check "the world was marked as seen" "0" "$(status grep -q '"seen"' /tmp/data/flux/worlds.json)"
+rm -f /tmp/slow-teardown
+
+# --- The world guard: a start on a volume whose world has not arrived (a half-synced g: volume) ---
+rm -f /tmp/data/Saved/game_0.db /tmp/data/Saved/game_0.db-wal /tmp/data/Saved/game_0.db-shm
+/opt/flux/flux-entrypoint.sh >/tmp/sup2.log 2>&1 &
+sup=$!
+check "a missing world this server had: the start waits for the sync" "0" "$(status wait_for "[ \"\$(flux-conan status | jget state)\" = updating ] && grep -q 'Waiting for it to sync' /tmp/sup2.log" 30)"
+check "with the reason in the state" "1" "$(flux-conan status | jget message | grep -c 'Waiting for it to sync')"
+check "and the game is not started on nothing" "1" "$(status pgrep -x ConanSandboxSer)"
+check "no new world was made" "1" "$(status test -e /tmp/data/Saved/game_0.db)"
+kill -TERM "${sup}"
+wait "${sup}"
+check "a stop while waiting exits 0" "0" "$?"
+FLUX_WORLD_SYNC_GRACE_SECONDS=0 /opt/flux/flux-entrypoint.sh >/tmp/sup2.log 2>&1 &
+sup=$!
+check "after the wait, the newest backup is put back and the server starts" "0" "$(status wait_for "grep -q 'the server is up (generation 1)' /tmp/sup2.log" 30)"
+check "and says so" "0" "$(status grep -q 'restored the newest backup' /tmp/sup2.log)"
+check "the status says which" "missing" "$(flux-conan status | jget worldRestored.reason)"
+kill -TERM "${sup}"
+wait "${sup}"
 
 # --- flux.log is local; the banner ----------------------------------------------------------------
 fl_srv="/tmp/srv"

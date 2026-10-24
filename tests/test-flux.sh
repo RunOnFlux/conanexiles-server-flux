@@ -59,6 +59,12 @@ stats='[2026.10.18-20.55.11:789][  3]LogServerStats: Status report. Uptime=120 M
 check "players from the status report" "3" "$(flux_players_from_stats "${stats}")"
 check "nothing from another line" "" "$(flux_players_from_stats '[x]LogNet: Players=4 joined')"
 
+# --- Passwords out of the logs ----------------------------------------------------------------
+check "the log filter hides the passwords" "LogInit: Command Line: ConanSandbox -log -Port=7777 -ServerPassword=<hidden> -AdminPassword=<hidden> -MaxPlayers=20" \
+  "$(printf 'LogInit: Command Line: ConanSandbox -log -Port=7777 -ServerPassword=joinme -AdminPassword="a b" -MaxPlayers=20\n' | flux_log_filter)"
+check "and drops NUL bytes" "abc" "$(printf 'a\0\0b\0c\n' | flux_log_filter)"
+check "flux_log hides it too" "x -ServerPassword=<hidden> -Y=1" "$(FLUX_LOG="" flux_log_raw 'x -ServerPassword=secret -Y=1')"
+
 # --- Steam builds ------------------------------------------------------------------------------
 cat >"${tmp}/manifest.acf" <<'EOF'
 "AppState"
@@ -181,6 +187,207 @@ cx do-restore >"${tmp}/restore"
 check "an older world goes in as game.db, for the server to convert" "ue4" "$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("select v from t").fetchone()[0])' "${data}/Saved/game.db")"
 check "and says so" "1" "$(grep -c 'converts it' "${tmp}/restore")"
 
+# The game's own rotating copies are not the world: a new world or a restore leaves them.
+mkdir -p "${data}/Saved"
+: >"${data}/Saved/game_0_backup_1.db"
+: >"${data}/Saved/game_0.db-wal"
+PYTHONPATH=scripts FLUX_DATA_DIR="${data}" python3 -c 'import fluxconan as c; c.remove_world()'
+check "remove_world keeps game_0_backup_N.db" "0" "$(status test -e "${data}/Saved/game_0_backup_1.db")"
+check "and removes the world's sidecars" "1" "$(status test -e "${data}/Saved/game_0.db-wal")"
+check "and the world" "1" "$(status test -e "${data}/Saved/game.db")"
+rm -f "${data}/Saved/game_0_backup_1.db"
+
+# Backups and restores are staged on the LOCAL volume, never on the synced one.
+mkdb() { python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("create table if not exists t(v)"); c.execute("delete from t"); c.execute("insert into t values (?)",(sys.argv[2],)); c.commit()' "$@"; }
+wval() { python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("select v from t").fetchone()[0])' "$1"; }
+mkdb "${data}/Saved/game_0.db" three
+cx backup manual force >/dev/null
+check "the backup was staged in flux-local/tmp" "0" "$(status test -d "${server}/flux-local/tmp")"
+check "nothing staged on the data volume" "0" "$(find "${data}" -name '.flux-*' | wc -l)"
+
+# A safety backup that fails stops a new world, an import or a restore: the world stays.
+# (backups into a folder that cannot be made: under a file, which stops root as well)
+rm -f "${data}/flux/worlds.json"
+: >"${tmp}/not-a-dir"
+cx new-world >/dev/null
+cx FLUX_BACKUP_DIR="${tmp}/not-a-dir/backups" do-restore >"${tmp}/restore"
+check "a failed safety backup keeps the world" "three" "$(wval "${data}/Saved/game_0.db")"
+check "and says so" "1" "$(grep -c 'NOT done: the safety backup failed' "${tmp}/restore")"
+check "in status.lastAction too" "new-world False" "$(cx status | python3 -c 'import json,sys;a=json.load(sys.stdin)["lastAction"];print(a["kind"],a["ok"])')"
+check "the request is dropped" "1" "$(status test -e "${data}/flux/restore-pending.json")"
+check "a failed backup exits 1 (the panel's: ok false)" "1 False" "$(cx FLUX_BACKUP_DIR="${tmp}/not-a-dir/backups" backup manual force >"${tmp}/b"; echo "$? $(grep -v '^#' "${tmp}/b" | jget ok)")"
+check "a new world is not marked while the backup fails" "1" "$(status test -e "${data}/flux/worlds.json")"
+
+# A restore puts back the backup's mods list, with the deployment's CONAN_MODS as it is now.
+cx CONAN_MODS="777777" set-mods '["777777"]' >/dev/null
+sleep 1
+cx CONAN_MODS="777777" backup manual force >/dev/null
+withmods="$(cx backups | python3 -c 'import json,sys;print(json.load(sys.stdin)["backups"][0]["name"])')"
+cx CONAN_MODS="888888" mods >/dev/null
+cx CONAN_MODS="888888" restore "${withmods}" >/dev/null
+cx CONAN_MODS="888888" do-restore >/dev/null
+check "a restore brings its mods list back" "777777" "$(cx CONAN_MODS="888888" mods | python3 -c 'import json,sys;print(*[m["id"] for m in json.load(sys.stdin)["mods"]])')"
+
+# The world guard. A world that is there starts, and is remembered by world-seen.
+guard() { cx FLUX_WORLD_SYNC_GRACE_SECONDS="${grace:-300}" world-guard; }
+check "guard: a world that is there starts" "0" "$(status guard)"
+cx world-seen
+check "world-seen remembers it" "1" "$(python3 -c 'import json,sys;print(int("seen" in json.load(open(sys.argv[1]))))' "${data}/flux/worlds.json")"
+mkdb "${data}/Saved/game_0.db" four
+rm -f "${data}/Saved/game_0.db"
+check "guard: a missing world first waits for the sync" "3" "$(status guard)"
+check "and says so" "1" "$(guard | grep -c 'Waiting for it to sync before putting a backup back')"
+check "no backup put back yet" "1" "$(status test -e "${data}/Saved/game_0.db")"
+grace=0 guard >"${tmp}/guard.out"
+check "guard: after the wait, the newest backup is put back, not a new world" "three" "$(wval "${data}/Saved/game_0.db")"
+check "and says so" "1" "$(grep -c 'restored the newest backup' "${tmp}/guard.out")"
+check "in the state too" "missing" "$(cx status | jget worldRestored.reason)"
+mv "${data}/flux/backups" "${tmp}/backups-aside"
+rm -f "${data}/Saved/game_0.db"
+grace=0 guard >"${tmp}/guard.out"
+check "guard: no backup, but the world existed: wait" "3" "$(grace=0 status guard)"
+check "with the reason" "1" "$(grep -c 'waiting for it to sync' "${tmp}/guard.out")"
+echo "not sqlite" >"${data}/Saved/game_0.db"
+check "guard: an unusable game_0.db is no world" "3" "$(grace=0 status guard)"
+check "and is kept aside, not deleted" "1" "$(find "${data}/Saved" -name 'game_0.db.flux-unusable-*' | wc -l)"
+rm -f "${data}/Saved"/game_0.db.flux-unusable-* "${data}/flux/worlds.json"
+: >"${data}/Saved/game_0_backup_2.db"
+check "guard: the game's own copies are a sign of a world too" "3" "$(grace=0 status guard)"
+rm -f "${data}/Saved/game_0_backup_2.db"
+check "a brand new server (no trace of a world) starts" "0" "$(grace=0 status guard)"
+mv "${tmp}/backups-aside" "${data}/flux/backups"
+cx world-seen
+cx new-world >/dev/null
+cx do-restore >/dev/null
+check "guard: after the panel's new world, a missing world starts" "0" "$(status guard)"
+check "an imported UE4 game.db is a world" "0" "$(mkdb "${data}/Saved/game.db" ue4; status guard)"
+rm -f "${data}/Saved/game.db"
+# A stop in the middle of a restore, after the world went and before the new one was in place
+# (the request then still pending, or already gone): the guard puts a backup back.
+cx world-seen 2>/dev/null; mkdb "${data}/Saved/game_0.db" five; cx world-seen
+rm -f "${data}/Saved/game_0.db"
+grace=0 guard >/dev/null
+check "guard: a world lost mid-restore comes back from the backups" "0" "$(status test -s "${data}/Saved/game_0.db")"
+# Syncthing conflict copies: moved aside, never a world, never in a backup.
+cp "${data}/Saved/game_0.db" "${data}/Saved/game_0.sync-conflict-20261023-101010-ABCDEFG.db"
+touch "${cfgdir}/ServerSettings.sync-conflict-20261023-101010-ABCDEFG.ini"
+guard >/dev/null
+check "conflict copies are moved to flux/sync-conflicts" "2 0" "$(find "${data}/flux/sync-conflicts" -type f | wc -l) $(find "${data}/Saved" -name '*sync-conflict*' | wc -l)"
+
+# Unreal's UTF-16 ini files (written so when a value has a character outside ASCII).
+printf '[ServerSettings]\r\nServerName=Caf\xc3\xa9\r\nAdminPassword=old\r\n' | python3 -c 'import sys; sys.stdout.buffer.write(b"\xff\xfe" + sys.stdin.buffer.read().decode().encode("utf-16-le"))' >"${tmp}/u16.ini"
+check "a UTF-16 ini is read" "Café" "$(ini "${tmp}/u16.ini" ServerSettings ServerName)"
+PYTHONPATH=scripts python3 -c 'import fluxconan as c,sys; c.ini_apply(sys.argv[1], [("ServerSettings", "AdminPassword", "new")])' "${tmp}/u16.ini"
+check "and written back as UTF-16 with its BOM" "fffe" "$(head -c 2 "${tmp}/u16.ini" | od -An -tx1 | tr -d ' \n')"
+check "the key replaced, not doubled" "new 1 1" "$(ini "${tmp}/u16.ini" ServerSettings AdminPassword) $(python3 -c 'import sys; t=open(sys.argv[1],encoding="utf-16").read(); print(t.count("AdminPassword"), t.count("[ServerSettings]"))' "${tmp}/u16.ini")"
+check "a UTF-8 ini stays UTF-8" "utf-8" "$(PYTHONPATH=scripts python3 -c 'import fluxconan as c,sys; print(c.ini_encoding(sys.argv[1]))' "${cfgdir}/Engine.ini")"
+
+# RCON: the karma limit, and a refused connection is one line, not a traceback.
+cx apply >/dev/null
+check "RconMaxKarma is high by default" "100000" "$(ini "${cfgdir}/Game.ini" RconPlugin RconMaxKarma)"
+cx CONAN_RCON_MAX_KARMA=500 apply >/dev/null
+check "CONAN_RCON_MAX_KARMA sets it" "500" "$(ini "${cfgdir}/Game.ini" RconPlugin RconMaxKarma)"
+check "a bad one is the default" "100000" "$(cx CONAN_RCON_MAX_KARMA=lots apply >/dev/null; ini "${cfgdir}/Game.ini" RconPlugin RconMaxKarma)"
+# A server that takes the connection and drops it at once (the karma system's denial).
+python3 -c '
+import socket,sys
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", 0)); s.listen(8)
+open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+while True:
+    c,_=s.accept(); c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\1\0\0\0\0\0\0\0"); c.close()
+' "${tmp}/rport" &
+deny_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "${tmp}/rport" ] && break; sleep 0.2; done
+cx CONAN_RCON_PORT="$(cat "${tmp}/rport")" apply >/dev/null
+cx rcon listplayers >"${tmp}/rcon.out" 2>&1
+check "a refused RCON connection exits 3" "3" "$?"
+check "with one line saying so, no traceback" "1 0" "$(grep -c 'RCON refused the connection' "${tmp}/rcon.out") $(grep -c Traceback "${tmp}/rcon.out")"
+check "players: the same, as JSON" "3" "$(status cx players)"
+kill "${deny_pid}" 2>/dev/null
+cx apply >/dev/null
+
+# Workshop mod updates: Steam's time_updated against SteamCMD's record.
+mkdir -p "${server}/steamapps/workshop"
+cat >"${server}/steamapps/workshop/appworkshop_440900.acf" <<'ACF'
+"AppWorkshop"
+{
+	"appid"		"440900"
+	"WorkshopItemsInstalled"
+	{
+		"444444"
+		{
+			"size"		"10"
+			"timeupdated"		"1700000000"
+			"manifest"		"1"
+		}
+		"555555"
+		{
+			"size"		"10"
+			"timeupdated"		"1700000500"
+			"manifest"		"2"
+		}
+	}
+	"WorkshopItemDetails"
+	{
+		"444444"
+		{
+			"timeupdated"		"1"
+		}
+	}
+}
+ACF
+check "installed mod times from the acf" "{'444444': 1700000000, '555555': 1700000500}" "$(PYTHONPATH=scripts FLUX_SERVER_DIR="${server}" python3 -c 'import fluxconan as c; print(c.installed_mod_times())')"
+check "only a newer, installed, not recently failed mod needs a restart" "['444444']" "$(PYTHONPATH=scripts python3 -c '
+import fluxconan as c
+print(c.mods_needing_update(["444444","555555","666666","777777"], {"444444":2,"555555":5,"666666":9,"777777":9}, {"444444":1,"555555":5,"777777":1}, {"777777":{"target":9,"at":100}}, 200))')"
+# A stand-in for Steam's GetPublishedFileDetails.
+python3 -c '
+import http.server,json,sys,urllib.parse
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        form=urllib.parse.parse_qs(self.rfile.read(int(self.headers["Content-Length"])).decode())
+        ids=[form[f"publishedfileids[{i}]"][0] for i in range(int(form["itemcount"][0]))]
+        body=json.dumps({"response":{"publishedfiledetails":[{"publishedfileid":i,"result":1,"time_updated":1700000900} for i in ids]}}).encode()
+        self.send_response(200); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self,*a): pass
+s=http.server.HTTPServer(("127.0.0.1",0),H); open(sys.argv[1],"w").write(str(s.server_port)); s.serve_forever()
+' "${tmp}/apiport" &
+api_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "${tmp}/apiport" ] && break; sleep 0.2; done
+api="http://127.0.0.1:$(cat "${tmp}/apiport")/"
+cx set-mods '["444444", "555555"]' >/dev/null
+check "a newer mod on Steam is found" "444444 555555" "$(cx FLUX_WORKSHOP_API="${api}" mods-update-check)"
+check "and is in the status" '["444444", "555555"]' "$(cx status | jget modUpdateWaiting)"
+check "mods-sync records an update that did not land" "2" "$(cx mods-sync | grep -c 'did not install')"
+check "so it is not retried" "1" "$(status cx FLUX_WORKSHOP_API="${api}" mods-update-check)"
+kill "${api_pid}" 2>/dev/null
+check "Steam unreachable: no restart, a warning" "1 1" "$(cx FLUX_WORKSHOP_API=http://127.0.0.1:9/ mods-update-check >"${tmp}/mu"; echo "$? $(grep -c 'could not ask Steam' "${tmp}/mu")")"
+check "no mods: nothing to ask" "1" "$(cx set-mods '[]' >/dev/null; status cx FLUX_WORKSHOP_API="${api}" mods-update-check)"
+
+# Bans: an offline player (or no server) is queued; apply writes the queue into blacklist.txt,
+# which the server reads only at start.
+check "a ban needs a SteamID64" "2" "$(status cx ban 12345)"
+check "with no server, a ban is queued" '{"ok": true, "online": false, "pending": true, "appliesOn": "restart"}' "$(cx ban 76561198000000001 cheating on purpose)"
+cx ban 76561198000000001 >/dev/null
+cx ban 76561198000000002 >/dev/null
+check "the queue, deduplicated" '["76561198000000001", "76561198000000002"]' "$(cx bans | jget pending)"
+check "bans without RCON: empty, with the reason, not a failure" "0 [] 1" "$(cx bans >"${tmp}/bans"; echo "$? $(jget bans <"${tmp}/bans") $(grep -c '"error"' "${tmp}/bans")")"
+check "unban takes one off the queue" '{"ok": true}' "$(cx unban 76561198000000002)"
+check "the queue after it" '["76561198000000001"]' "$(cx bans | jget pending)"
+printf '76561198000000009\n76561198000000001\n' >"${data}/Saved/blacklist.txt"
+cx ban 76561198000000003 >/dev/null
+cx apply >"${tmp}/args"
+check "apply writes the queued bans not listed yet" "76561198000000009 76561198000000001 76561198000000003" "$(tr '\n' ' ' <"${data}/Saved/blacklist.txt" | sed 's/ $//')"
+check "and says so" "1" "$(grep -c 'bans from the panel: 1 written' "${tmp}/args")"
+check "and clears the queue" "1" "$(status test -e "${data}/flux/bans-pending.json")"
+check "the launch line is unchanged by it" "0" "$(grep -c 'blacklist' <(grep -v '^#' "${tmp}/args"))"
+cx unban 76561198000000009 >/dev/null
+check "unban with no server takes the line out of blacklist.txt" "76561198000000001 76561198000000003" "$(tr '\n' ' ' <"${data}/Saved/blacklist.txt" | sed 's/ $//')"
+rm -f "${data}/Saved/blacklist.txt"
+cx ban 76561198000000004 >/dev/null
+cx apply >/dev/null
+check "blacklist.txt is made when there is none" "76561198000000004" "$(cat "${data}/Saved/blacklist.txt")"
+
 # Failed updates: a target that did not install is skipped for 6 hours.
 mkdir -p "${server}/steamapps" && printf '"AppState"\n{\n\t"buildid"\t\t"100"\n}\n' >"${server}/steamapps/appmanifest_443030.acf"
 cx update-target 200
@@ -208,6 +415,9 @@ check "the next daily restart" "1791800000" "$(cx status | jget nextRestart)"
 check "the build" "100" "$(cx status | jget build)"
 cx note nextRestart
 check "removed" "None" "$(cx status | jget nextRestart)"
+cx note nextRestart 1791800000
+cx state stopped
+check "a stopped server has no next restart" "None" "$(cx status | jget nextRestart)"
 check "rcon without a server says so" "3" "$(status cx rcon listplayers)"
 check "and in words the hub knows" "1" "$(cx rcon listplayers | grep -c 'no server is running')"
 

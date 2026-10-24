@@ -39,12 +39,24 @@ FLUX_GAME_UID="${FLUX_GAME_UID:-1000}"
 # One line, to the container's output and (when FLUX_LOG is set) to flux.log, rotated at
 # FLUX_LOG_MAX_BYTES (the old file becomes flux.log.1).
 flux_log_raw() {
-  printf '%s\n' "$1"
+  local line="$1"
+  # A password option on a line (the launch line, an error quoting it) is never logged.
+  if [[ "${line,,}" == *password=* ]]; then
+    line="$(printf '%s\n' "${line}" | flux_log_filter)"
+  fi
+  printf '%s\n' "${line}"
   if [ -n "${FLUX_LOG}" ] && mkdir -p "$(dirname "${FLUX_LOG}")" 2>/dev/null; then
-    printf '%s\n' "$1" >>"${FLUX_LOG}" 2>/dev/null || return 0
+    printf '%s\n' "${line}" >>"${FLUX_LOG}" 2>/dev/null || return 0
     flux_rotate_log "${FLUX_LOG}" "${FLUX_LOG_MAX_BYTES}"
   fi
   return 0
+}
+
+# stdin -> stdout, line by line (unbuffered): what the game's log may show. NUL bytes are dropped
+# (a log emptied under the game reads back as a run of them), and the value of -ServerPassword=
+# and -AdminPassword= (the game prints its whole command line at start) becomes <hidden>.
+flux_log_filter() {
+  sed -u -E -e 's/\x00//g' -e 's/(-(server|admin)password=)("[^"]*"|[^ ]*)/\1<hidden>/Ig'
 }
 
 flux_log() {

@@ -12,12 +12,20 @@
     fluxconan.py players-seen <n>    the player count of the last LogServerStats line
     fluxconan.py backup <why> [force]
     fluxconan.py do-restore          a pending restore or new world, before a start
+    fluxconan.py world-guard         before a start: exit 0 to start, 3 to wait (a world this
+                                     server had is missing: see "The world guard" below)
+    fluxconan.py world-seen          the server is up: its world is one never to replace silently
     fluxconan.py update-target|update-check|update-skip <build>
+    fluxconan.py mods-update-check   exit 0 when Steam has a newer version of a listed mod (the ids
+                                     go to state.json modUpdateWaiting), 1 when not or unknown
 
     flux-conan status                state, players, build, mods, generation (one JSON document)
     flux-conan rcon <command...>     one RCON command on the running server, its answer printed
     flux-conan players               the online players (listplayers), as JSON
-    flux-conan bans                  the ban list (listbans), as JSON
+    flux-conan bans                  the ban list (listbans) and the bans queued for the next start
+    flux-conan ban <steamid64> [why] at once when the player is online, else queued (blacklist.txt
+                                     is read only at start); never restarts the server
+    flux-conan unban <steamid64>
     flux-conan mods                  the mods list, in load order, with what is downloaded
     flux-conan set-mods '<json>'     ["<workshop id>", ...] in load order; applied on the next start
     flux-conan settings [key...]     ServerSettings.ini values (the PvP schedule's when none named)
@@ -73,10 +81,20 @@ RESTORE_FILE = os.path.join(STATE_DIR, "restore-pending.json")
 UPDATE_TARGET_FILE = os.path.join(STATE_DIR, "update-target.json")
 UPDATE_FAILED_FILE = os.path.join(STATE_DIR, "update-failed.json")
 UPDATE_FAILED_SKIP = 6 * 3600
+MOD_UPDATE_TARGET_FILE = os.path.join(STATE_DIR, "mods-update-target.json")
+MOD_UPDATE_FAILED_FILE = os.path.join(STATE_DIR, "mods-update-failed.json")
 MODS_DIR = os.path.join(SERVER_DIR, "ConanSandbox", "Mods")
 WORKSHOP_APP = "440900"
 WORKSHOP_DIR = os.path.join(SERVER_DIR, "steamapps", "workshop", "content", WORKSHOP_APP)
-GAME_LOG = os.environ.get("FLUX_GAME_LOG", os.path.join(SERVER_DIR, "flux-local", "logs", "current.log"))
+# SteamCMD's record of the Workshop items it installed (timeupdated per item).
+WORKSHOP_ACF = os.path.join(SERVER_DIR, "steamapps", "workshop", f"appworkshop_{WORKSHOP_APP}.acf")
+WORKSHOP_API = os.environ.get("FLUX_WORKSHOP_API",
+                              "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/")
+# What churns or can be made again, LOCAL to the node (never synced): the game's logs, and the
+# staging folders of a backup or a restore (a world-sized file Syncthing must not carry).
+LOCAL_DIR = os.environ.get("FLUX_LOCAL_DIR", os.path.join(SERVER_DIR, "flux-local"))
+LOCAL_TMP = os.path.join(LOCAL_DIR, "tmp")
+GAME_LOG = os.environ.get("FLUX_GAME_LOG", os.path.join(LOCAL_DIR, "logs", "current.log"))
 ENGINE_LOG = os.environ.get("FLUX_ENGINE_LOG", os.path.join(SAVED_DIR, "Logs", "ConanSandbox.log"))
 RESTART_MARKER = os.environ.get("FLUX_RESTART_MARKER", "/tmp/flux-restart-requested")
 GENERATION_FILE = os.environ.get("FLUX_GENERATION_FILE", "/tmp/flux-generation")
@@ -90,11 +108,26 @@ GAME_COMM = os.environ.get("FLUX_GAME_COMM", GAME_PROCESS[:15])
 # API writes one consistent file.
 WORLD_DB = "game_0.db"
 LEGACY_DB = "game.db"
+# The game's own rotating copies of the world (game_0_backup_N.db).
+GAME_BACKUP_RE = re.compile(r"^game(_\d+)?_backup_\d+\.db$")
+# Whether this server has had a world, and a new world the panel asked for (world-guard).
+WORLDS_SEEN = os.path.join(STATE_DIR, "worlds.json")
+# When the world went missing, on THIS node (kept off the synced volume, so each node counts its
+# own wait), and how long the guard waits for Syncthing before it puts a backup back.
+WORLD_MISSING = os.path.join(LOCAL_DIR, "world-missing.json")
+WORLD_SYNC_GRACE = int(os.environ.get("FLUX_WORLD_SYNC_GRACE_SECONDS", "300"))
+CONFLICTS_DIR = os.path.join(STATE_DIR, "sync-conflicts")
 
 MAX_PLAYERS_CAP = 70
 DEFAULT_PORT = 7777
 DEFAULT_QUERY_PORT = 27015
 DEFAULT_RCON_PORT = 25575
+# The game's RCON anti-flood ("karma"): past RconMaxKarma, connections from an address are denied
+# for minutes ("triggered karma system and has been denied"). 60 was reached by ~14 one-shot
+# connections in 15 s from 127.0.0.1 (measured, 2026-10-24), and every RCON user is inside the
+# container (the hub's player list every 15 s, the stop's checkpoint, the restart warnings), so
+# the limit only ever locks us out. CONAN_RCON_MAX_KARMA overrides it.
+DEFAULT_RCON_MAX_KARMA = 100000
 NAME_MAX = 60
 PASSWORD_MAX = 32
 
@@ -181,6 +214,16 @@ def max_players():
     return int(raw)
 
 
+def rcon_max_karma():
+    raw = env("CONAN_RCON_MAX_KARMA")
+    if raw is None:
+        return DEFAULT_RCON_MAX_KARMA
+    if not re.fullmatch(r"\d{1,9}", raw) or int(raw) < 1:
+        print(f"# WARN CONAN_RCON_MAX_KARMA={raw} is not a positive number; using {DEFAULT_RCON_MAX_KARMA}")
+        return DEFAULT_RCON_MAX_KARMA
+    return int(raw)
+
+
 def rcon_password():
     """The owner's (CONAN_RCON_PASSWORD), or one made up once and kept on the data volume: RCON is
     always on, because the hub's console, player list and bans speak it from inside the container."""
@@ -207,9 +250,25 @@ def rcon_password():
 # that way, and Enhanced rewrote ClanMaxSize as clanMaxSize). Every other line is kept as it is.
 # ------------------------------------------------------------------------------------------------
 
+def ini_encoding(path):
+    """How the file is written. Unreal saves an ini as UTF-16LE with a BOM when a value has a
+    character outside ASCII (a name with an accent); read as UTF-8 that is one garbled line per
+    character, and every section would be added again. The file is written back the same way."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(3)
+    except OSError:
+        return "utf-8"
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return "utf-16"
+    if head == b"\xef\xbb\xbf":
+        return "utf-8-sig"
+    return "utf-8"
+
+
 def ini_read(path):
     try:
-        with open(path, encoding="utf-8-sig", errors="replace") as f:
+        with open(path, encoding=ini_encoding(path), errors="replace") as f:
             return f.read().splitlines()
     except OSError:
         return []
@@ -264,10 +323,11 @@ def ini_set(lines, section, key, value):
     return out_lines
 
 
-def ini_write(path, lines):
+def ini_write(path, lines, encoding="utf-8"):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".flux-tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    # "utf-16" writes the BOM and little-endian on this machine, as Unreal does.
+    with open(tmp, "w", encoding=encoding) as f:
         f.write("\n".join(lines).rstrip("\n") + "\n")
     os.replace(tmp, path)
 
@@ -279,7 +339,7 @@ def ini_apply(path, changes):
     for section, key, value in changes:
         lines = ini_set(lines, section, key, value)
     if lines != before:
-        ini_write(path, lines)
+        ini_write(path, lines, ini_encoding(path))
         return True
     return False
 
@@ -373,7 +433,7 @@ def cmd_apply():
         ("RconPlugin", "RconEnabled", "1"),
         ("RconPlugin", "RconPassword", rcon_password()),
         ("RconPlugin", "RconPort", str(rcon_port)),
-        ("RconPlugin", "RconMaxKarma", "60"),
+        ("RconPlugin", "RconMaxKarma", str(rcon_max_karma())),
         ("/Script/Engine.GameSession", "MaxPlayers", str(players)),
     ])
     os.chmod(game_ini, 0o600)
@@ -396,6 +456,7 @@ def cmd_apply():
     # started with its section, and the server adds the rest on its first start.
     settings_ini = os.path.join(CONFIG_DIR, "ServerSettings.ini")
     apply_pending_settings(settings_ini)
+    apply_pending_bans()
     ini_apply(settings_ini, [
         ("ServerSettings", "AdminPassword", admin),
         ("ServerSettings", "ServerPassword", password),
@@ -509,6 +570,7 @@ def cmd_mods_sync():
     if missing:
         print(f"# WARN not downloaded (no .pak): {', '.join(missing)}")
     print(f"# mods: {len(ids) - len(missing)} of {len(ids)} loaded, {len(lines)} pak file(s)")
+    mods_update_landed()
 
 
 # ------------------------------------------------------------------------------------------------
@@ -615,6 +677,19 @@ class RconError(Exception):
     pass
 
 
+class RconRefused(RconError):
+    """The server took the connection and dropped it before answering: its anti-flood ("karma")
+    denies an address for minutes after too many connections."""
+
+
+RCON_REFUSED = ("RCON refused the connection (the game's anti-flood \"karma\" limit, Game.ini "
+                "RconMaxKarma): wait a few minutes and try again")
+
+
+class RconClosed(RconError):
+    pass
+
+
 def _rcon_packet(req_id, kind, body):
     data = body.encode("utf-8") + b"\x00\x00"
     return struct.pack("<iii", len(data) + 8, req_id, kind) + data
@@ -626,7 +701,7 @@ def _rcon_read(sock):
         while len(buf) < n:
             chunk = sock.recv(n - len(buf))
             if not chunk:
-                raise RconError("the server closed the RCON connection")
+                raise RconClosed("the server closed the RCON connection")
             buf += chunk
         return buf
     size = struct.unpack("<i", exact(4))[0]
@@ -661,6 +736,8 @@ def rcon(command, timeout=8.0, idle=0.4):
         raise RconError(f"the server is not answering RCON on port {port} ({e.strerror or e}): is it still starting?")
     sock.settimeout(timeout)
     try:
+        # A connection the karma system denies is accepted and closed at once (or reset): the
+        # login or the command then meets a closed socket, never an answer.
         sock.sendall(_rcon_packet(1, 3, password))
         while True:
             req_id, kind, _ = _rcon_read(sock)
@@ -674,11 +751,15 @@ def rcon(command, timeout=8.0, idle=0.4):
         while True:
             try:
                 parts.append(_rcon_read(sock)[2])
-            except (socket.timeout, RconError):
+            except (OSError, RconError):
                 break
         return "".join(parts)
     except socket.timeout:
         raise RconError("the server did not answer in time")
+    except (RconClosed, BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        raise RconRefused(RCON_REFUSED)
+    except OSError as e:
+        raise RconError(f"RCON failed ({e.strerror or e})")
     finally:
         sock.close()
 
@@ -694,6 +775,9 @@ def cmd_rcon(*words):
     try:
         sys.stdout.write(rcon(command))
         sys.stdout.write("\n")
+    except RconRefused as e:
+        print(str(e))
+        sys.exit(3)
     except RconError as e:
         print(f"no server is running: {e}")
         sys.exit(3)
@@ -754,12 +838,105 @@ def ban_rows(text):
     return bans
 
 
+# Bans. `banplayer platformid <id>` works only on a player who is ONLINE ("No player with
+# platform ID <id>." otherwise), and the server reads Saved/blacklist.txt (one SteamID64 a line)
+# only at start: an id written there while it runs is not banned (measured, build 25792439). So a
+# ban of someone offline is queued in flux/bans-pending.json and written into blacklist.txt by
+# `apply`, before the next start. `unbanplayer <id>` works live and rewrites the file.
+
+STEAM_ID_RE = re.compile(r"^7656119\d{10}$")
+BANS_PENDING = os.path.join(STATE_DIR, "bans-pending.json")
+BLACKLIST = os.path.join(SAVED_DIR, "blacklist.txt")
+
+
+def pending_bans():
+    ids = read_json(BANS_PENDING, [])
+    return [str(i) for i in ids if STEAM_ID_RE.match(str(i))] if isinstance(ids, list) else []
+
+
+def write_pending_bans(ids):
+    write_json(BANS_PENDING, list(dict.fromkeys(ids)), indent=None)
+
+
+def blacklist_lines():
+    try:
+        with open(BLACKLIST, encoding=ini_encoding(BLACKLIST), errors="replace") as f:
+            return f.read().splitlines()
+    except OSError:
+        return []
+
+
+def write_blacklist(lines):
+    ini_write(BLACKLIST, lines, ini_encoding(BLACKLIST))
+    try:
+        uid = int(os.environ.get("FLUX_GAME_UID", "1000"))
+        os.chown(BLACKLIST, uid, uid)
+    except (OSError, ValueError):
+        pass
+
+
+def listed_id(line):
+    """The SteamID64 a blacklist.txt line is about (the line may carry more after it)."""
+    m = re.match(r"\s*(\d{17})", line)
+    return m.group(1) if m else None
+
+
+def cmd_ban(steam_id, *reason):
+    if not STEAM_ID_RE.match(str(steam_id)):
+        fail("not a SteamID64 (7656119 and 10 more digits)", 2)
+    if game_pids():
+        why = clean_text(one_line(" ".join(reason)), 120) or "Banned by an admin"
+        try:
+            reply = rcon(f"banplayer platformid {steam_id} {why}")
+            low = reply.lower()
+            if "banned" in low and "no player" not in low and "couldn't parse" not in low:
+                out({"ok": True, "online": True})
+                return
+        except RconError:
+            pass
+    write_pending_bans(pending_bans() + [str(steam_id)])
+    out({"ok": True, "online": False, "pending": True, "appliesOn": "restart"})
+
+
+def cmd_unban(steam_id):
+    if not STEAM_ID_RE.match(str(steam_id)):
+        fail("not a SteamID64 (7656119 and 10 more digits)", 2)
+    write_pending_bans([i for i in pending_bans() if i != steam_id])
+    if game_pids():
+        try:
+            rcon(f"unbanplayer {steam_id}")
+        except RconError:
+            pass
+    else:
+        lines = blacklist_lines()
+        kept = [line for line in lines if listed_id(line) != steam_id]
+        if kept != lines:
+            write_blacklist(kept)
+    out({"ok": True})
+
+
+def apply_pending_bans():
+    """Before a start: the queued bans into Saved/blacklist.txt (the ones not there yet)."""
+    pending = pending_bans()
+    if not pending:
+        return
+    lines = blacklist_lines()
+    listed = {listed_id(line) for line in lines}
+    new = [i for i in pending if i not in listed]
+    if new or not os.path.exists(BLACKLIST):
+        write_blacklist([line for line in lines if line.strip()] + new)
+    os.remove(BANS_PENDING)
+    print(f"# bans from the panel: {len(new)} written to blacklist.txt")
+
+
 def cmd_bans():
+    """The ban list (listbans) and the bans queued for the next start. Without RCON (no server,
+    or it refused), bans is empty and `error` says why: the queue is still worth showing."""
     try:
         raw = rcon("listbans")
-        out({"bans": ban_rows(raw), "raw": raw})
+        out({"bans": ban_rows(raw), "raw": raw, "pending": pending_bans()})
     except RconError as e:
-        fail(str(e), 3)
+        out({"bans": [], "raw": None, "pending": pending_bans(), "error": str(e)})
 
 
 # ------------------------------------------------------------------------------------------------
@@ -773,6 +950,10 @@ def cmd_state(state, message=None):
     data["state"] = state
     if state == "running":
         data.pop("failedMods", None)
+    # A stopped server has no restart coming and no update waiting.
+    if state == "stopped":
+        for key in ("nextRestart", "updateWaiting", "modUpdateWaiting"):
+            data.pop(key, None)
     if message:
         data["message"] = message
     else:
@@ -896,9 +1077,12 @@ def cmd_status():
         "mods": len(ids),
         "nextRestart": state.get("nextRestart"),
         "updateWaiting": state.get("updateWaiting"),
+        "modUpdateWaiting": state.get("modUpdateWaiting"),
         "failedMods": state.get("failedMods"),
         "restartPending": os.path.exists(RESTART_MARKER),
         "pending": (read_json(RESTORE_FILE, {}) or {}).get("backup"),
+        "lastAction": state.get("lastAction"),
+        "worldRestored": state.get("worldRestored"),
         "image": os.environ.get("FLUX_IMAGE_VERSION", "dev"),
     })
 
@@ -980,35 +1164,53 @@ def sqlite_copy(src, dst):
         source.close()
 
 
-def cmd_backup(why, force=None):
+def is_conflict(name):
+    """A Syncthing conflict copy (name.sync-conflict-<date>-<time>-<device>.ext): never a world,
+    never in a backup."""
+    return "sync-conflict" in os.path.basename(name)
+
+
+def local_staging(prefix):
+    """A staging folder on the LOCAL volume: a world copy made on the synced one would be copied
+    to the other node as it is written."""
+    os.makedirs(LOCAL_TMP, exist_ok=True)
+    return tempfile.mkdtemp(dir=LOCAL_TMP, prefix=prefix)
+
+
+class BackupError(Exception):
+    pass
+
+
+def make_backup(why, force=None):
+    """The backup itself. Returns its name; None when there is nothing to do (no world yet, or a
+    recent one is enough); raises BackupError when it could not be made."""
     db = world_db()
     if not db:
         print("# backup skipped: no world yet")
-        if force == "force":
-            out({"ok": False, "error": "There is no world to back up yet: the server makes it on its first start."})
-        return
+        return None
     names = backup_files()
     now = int(time.time())
     min_age = int(os.environ.get("FLUX_BACKUP_MIN_AGE_MINUTES", "60")) * 60
     if force not in ("force", "force-quiet") and names and now - backup_time(names[0]) < min_age:
         print(f"# backup ({why}) skipped: the newest is {(now - backup_time(names[0])) // 60} min old")
-        return
-    os.makedirs(BACKUP_DIR, exist_ok=True)
+        return None
     name = time.strftime("%Y%m%d-%H%M%S", time.gmtime(now)) + "-conan.tar.gz"
     if name in names:
         time.sleep(1)
         now = int(time.time())
         name = time.strftime("%Y%m%d-%H%M%S", time.gmtime(now)) + "-conan.tar.gz"
     out_path = os.path.join(BACKUP_DIR, name)
-    staging = tempfile.mkdtemp(dir=STATE_DIR, prefix=".flux-backup-")
+    staging = None
     try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        staging = local_staging(".flux-backup-")
         copy = os.path.join(staging, WORLD_DB)
         sqlite_copy(db, copy)
         with tarfile.open(out_path + ".part", "w:gz") as t:
             t.add(copy, arcname=f"Saved/{WORLD_DB}")
             if os.path.isdir(CONFIG_DIR):
                 for f in sorted(os.listdir(CONFIG_DIR)):
-                    if f.endswith(".ini"):
+                    if f.endswith(".ini") and not is_conflict(f):
                         t.add(os.path.join(CONFIG_DIR, f), arcname=f"Saved/Config/LinuxServer/{f}")
             if os.path.isfile(MODS_FILE):
                 t.add(MODS_FILE, arcname="flux/mods.json")
@@ -1018,12 +1220,10 @@ def cmd_backup(why, force=None):
             os.remove(out_path + ".part")
         except OSError:
             pass
-        print(f"# WARN backup ({why}) failed: {e}")
-        if force == "force":
-            out({"ok": False, "error": f"The backup failed: {e}"})
-        return
+        raise BackupError(str(e))
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        if staging:
+            shutil.rmtree(staging, ignore_errors=True)
     index = read_json(BACKUP_INDEX, {}) or {}
     index[name] = why
     keep = int(os.environ.get("FLUX_BACKUP_KEEP", "10"))
@@ -1037,10 +1237,25 @@ def cmd_backup(why, force=None):
                 pass
             index.pop(old, None)
     write_json(BACKUP_INDEX, {k: v for k, v in index.items() if k in kept}, indent=None)
-    size = os.path.getsize(out_path)
-    print(f"# backup ({why}): flux/backups/{name}, {size // 1024} KB")
+    print(f"# backup ({why}): flux/backups/{name}, {os.path.getsize(out_path) // 1024} KB")
+    return name
+
+
+def cmd_backup(why, force=None):
+    """The supervisor's and the panel's backup. Exit 1 when it failed; with `force` (the panel's
+    "back up now") the outcome is also one JSON line."""
+    try:
+        name = make_backup(why, force)
+    except BackupError as e:
+        print(f"# WARN backup ({why}) failed: {e}")
+        if force == "force":
+            out({"ok": False, "error": f"The backup failed: {e}"})
+        sys.exit(1)
     if force == "force":
-        out({"ok": True, "name": name, "size": size})
+        if name:
+            out({"ok": True, "name": name, "size": os.path.getsize(os.path.join(BACKUP_DIR, name))})
+        else:
+            out({"ok": False, "error": "There is no world to back up yet: the server makes it on its first start."})
 
 
 def cmd_backups():
@@ -1097,66 +1312,245 @@ def cmd_import_world(name):
 
 
 def remove_world():
+    """The world database and its sidecars. The game's own rotating copies (game_0_backup_N.db)
+    stay: they are the game's, and the world guard counts them as a sign a world existed."""
     for f in os.listdir(SAVED_DIR) if os.path.isdir(SAVED_DIR) else []:
-        if re.match(r"^game(_\d+)?(_backup_\d+)?\.db(-wal|-shm|-journal)?$", f):
+        if re.match(r"^game(_\d+)?\.db(-wal|-shm|-journal)?$", f):
             try:
                 os.remove(os.path.join(SAVED_DIR, f))
             except OSError:
                 pass
 
 
+def put_world(src, target=WORLD_DB):
+    """src becomes Saved/<target>, the old world (both names, their sidecars) gone. Copied next to
+    it first and renamed into place, so the world is never missing for longer than a rename."""
+    os.makedirs(SAVED_DIR, exist_ok=True)
+    tmp = os.path.join(SAVED_DIR, target + ".flux-new")
+    shutil.copy2(src, tmp)
+    remove_world()
+    os.replace(tmp, os.path.join(SAVED_DIR, target))
+
+
+def iso_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def record_last_action(kind, name, ok, error=None):
+    """status.lastAction: the restore / import / new world the panel asked for, as the start that
+    applied (or refused) it saw it."""
+    data = read_json(STATE_FILE, {}) or {}
+    data["lastAction"] = {"kind": kind, "name": name, "ok": bool(ok), "error": error, "at": iso_now()}
+    write_json(STATE_FILE, data, indent=None)
+
+
+def mark_new_world():
+    write_json(WORLDS_SEEN, {"newWorld": int(time.time())}, indent=None)
+
+
 def cmd_do_restore():
+    """The supervisor, before a start: the pending restore, import or new world. A safety backup
+    first, and NOTHING is changed when it fails (the request is dropped, the reason is in
+    status.lastAction and the start's message). The request is removed only once it is done, so a
+    stop in the middle runs it again on the next start."""
     pending = read_json(RESTORE_FILE)
     if not isinstance(pending, dict):
         return
+    action = pending.get("action") or "restore"
+    name = pending.get("backup") or pending.get("file")
+    staging = None
+    try:
+        if action == "import":
+            src = os.path.join(IMPORT_DIR, os.path.basename(str(pending.get("file", ""))))
+            if not looks_like_sqlite(src):
+                raise ValueError(f"{pending.get('file')} is gone or not a world")
+            make_backup("before importing a world", "force-quiet")
+            target = LEGACY_DB if os.path.basename(src).lower() == LEGACY_DB else WORLD_DB
+            put_world(src, target)
+            os.remove(src)
+            print(f"# imported {os.path.basename(src)} as Saved/{target}"
+                  + (" (an older world: the server converts it on this start)" if target == LEGACY_DB else ""))
+        elif action == "new-world":
+            make_backup("before a new world", "force-quiet")
+            # Marked BEFORE the world goes: the world guard lets this missing world through.
+            mark_new_world()
+            remove_world()
+            print("# a new world: the old one is in the backups")
+        else:
+            src = os.path.join(BACKUP_DIR, name or "")
+            if not BACKUP_NAME_RE.match(name or "") or not os.path.isfile(src):
+                raise ValueError(f"{name} is not a backup")
+            staging = local_staging(".flux-restore-")
+            with tarfile.open(src) as t:
+                members = [m for m in t.getmembers() if m.isfile() and (m.name.startswith("Saved/") or m.name == "flux/mods.json")]
+                if not any(m.name == f"Saved/{WORLD_DB}" for m in members) or any(".." in m.name.split("/") for m in members):
+                    raise ValueError("not a Conan Exiles backup")
+                t.extractall(staging, members=members, filter="data")
+            make_backup("before restoring " + name, "force-quiet")
+            put_world(os.path.join(staging, "Saved", WORLD_DB))
+            cfg = os.path.join(staging, "Saved", "Config", "LinuxServer")
+            if os.path.isdir(cfg):
+                os.makedirs(CONFIG_DIR, exist_ok=True)
+                for f in os.listdir(cfg):
+                    shutil.copy2(os.path.join(cfg, f), os.path.join(CONFIG_DIR, f))
+            restored_mods = read_json(os.path.join(staging, "flux", "mods.json"))
+            if isinstance(restored_mods, dict):
+                # The backup's list, with the deployment's CONAN_MODS as it is NOW counted as seen:
+                # an older envSeen would make a CONAN_MODS that differs replace the restored list.
+                current = read_json(MODS_FILE, {}) or {}
+                seen = current.get("envSeen") if "envSeen" in current else (os.environ.get("CONAN_MODS") or "").strip()
+                restored_mods["envSeen"] = seen
+                write_json(MODS_FILE, restored_mods)
+            print(f"# restored {name}")
+    except BackupError as e:
+        print(f"# WARN {action} of {name or 'the world'} NOT done: the safety backup failed ({e}); the world is untouched")
+        record_last_action(action, name, False, f"the safety backup failed: {e}")
+        drop_pending()
+        return
+    except (OSError, tarfile.TarError, ValueError, sqlite3.Error) as e:
+        print(f"# WARN {action} of {name or 'the world'} failed ({e}); nothing changed")
+        record_last_action(action, name, False, str(e))
+        drop_pending()
+        return
+    finally:
+        if staging:
+            shutil.rmtree(staging, ignore_errors=True)
+    record_last_action(action, name, True)
+    drop_pending()
+
+
+def drop_pending():
     try:
         os.remove(RESTORE_FILE)
     except OSError:
         pass
-    if pending.get("action") == "import":
-        src = os.path.join(IMPORT_DIR, os.path.basename(str(pending.get("file", ""))))
-        if not looks_like_sqlite(src):
-            print(f"# WARN import: {pending.get('file')} is gone or not a world; nothing changed")
-            return
-        cmd_backup("before importing a world", "force-quiet")
-        remove_world()
-        target = LEGACY_DB if os.path.basename(src).lower() == LEGACY_DB else WORLD_DB
-        shutil.move(src, os.path.join(SAVED_DIR, target))
-        print(f"# imported {os.path.basename(src)} as Saved/{target}"
-              + (" (an older world: the server converts it on this start)" if target == LEGACY_DB else ""))
-        return
-    if pending.get("action") == "new-world":
-        cmd_backup("before a new world", "force-quiet")
-        remove_world()
-        print("# a new world: the old one is in the backups")
-        return
-    name = pending.get("backup", "")
-    src = os.path.join(BACKUP_DIR, name)
-    if not BACKUP_NAME_RE.match(name) or not os.path.isfile(src):
-        print(f"# WARN restore: {name} is not a backup; nothing restored")
-        return
-    cmd_backup("before restoring " + name, "force-quiet")
-    staging = tempfile.mkdtemp(dir=STATE_DIR, prefix=".flux-restore-")
+
+
+# ------------------------------------------------------------------------------------------------
+# The world guard (before every start). Flux runs this app on two nodes with the data volume
+# synced (Syncthing): a node can start on a volume whose game_0.db has not arrived yet, and the
+# game then makes a NEW world without a word, which syncs back over the real one. So: when the
+# world is missing but this server had one (flux/worlds.json, a backup, or the game's own
+# game_0_backup_N.db), the game is not started on nothing: after FLUX_WORLD_SYNC_GRACE_SECONDS for
+# the sync, the newest backup is put back, or, with none, the start keeps waiting. A new world
+# the panel asked for (new-world) is let through. Sync-conflict copies are moved aside.
+# ------------------------------------------------------------------------------------------------
+
+def quarantine_conflicts():
+    moved = []
+    for root, _dirs, files in os.walk(SAVED_DIR):
+        if os.path.islink(root):
+            continue
+        for f in files:
+            if is_conflict(f):
+                os.makedirs(CONFLICTS_DIR, exist_ok=True)
+                rel = os.path.relpath(os.path.join(root, f), SAVED_DIR).replace(os.sep, "__")
+                try:
+                    os.replace(os.path.join(root, f), os.path.join(CONFLICTS_DIR, rel))
+                    moved.append(rel)
+                except OSError:
+                    pass
+    return moved
+
+
+def world_usable(path):
+    return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 0 and looks_like_sqlite(path)
+
+
+def mark_world_seen(db):
+    write_json(WORLDS_SEEN, {"seen": int(time.time()), "size": os.path.getsize(db)}, indent=None)
+
+
+def cmd_world_seen():
+    """The watcher, once the server is up: this world is one the server must never silently replace."""
+    db = world_db()
+    if world_usable(db):
+        mark_world_seen(db)
+
+
+def clear_world_missing():
     try:
-        with tarfile.open(src) as t:
-            members = [m for m in t.getmembers() if m.isfile() and (m.name.startswith("Saved/") or m.name == "flux/mods.json")]
-            if not any(m.name == f"Saved/{WORLD_DB}" for m in members) or any(".." in m.name.split("/") for m in members):
-                raise ValueError("not a Conan Exiles backup")
-            t.extractall(staging, members=members, filter="data")
-        remove_world()
-        shutil.copy2(os.path.join(staging, "Saved", WORLD_DB), os.path.join(SAVED_DIR, WORLD_DB))
-        cfg = os.path.join(staging, "Saved", "Config", "LinuxServer")
-        if os.path.isdir(cfg):
-            os.makedirs(CONFIG_DIR, exist_ok=True)
-            for f in os.listdir(cfg):
-                shutil.copy2(os.path.join(cfg, f), os.path.join(CONFIG_DIR, f))
-        if os.path.isfile(os.path.join(staging, "flux", "mods.json")):
-            shutil.copy2(os.path.join(staging, "flux", "mods.json"), MODS_FILE)
-        print(f"# restored {name}")
-    except (OSError, tarfile.TarError, ValueError) as e:
-        print(f"# WARN restore of {name} failed ({e}); nothing changed")
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        os.remove(WORLD_MISSING)
+    except OSError:
+        pass
+
+
+def cmd_world_guard():
+    """Exit 0: start the game (the world is there, was put back from a backup, or is a new one on
+    purpose). Exit 3: do not start, wait (the reason is the last line)."""
+    for rel in quarantine_conflicts():
+        print(f"# WARN a Syncthing conflict copy {rel} was moved to flux/sync-conflicts/")
+    seen = read_json(WORLDS_SEEN, {})
+    seen = seen if isinstance(seen, dict) else {}
+    db = world_db()
+    if world_usable(db):
+        clear_world_missing()
+        return 0
+    if seen.get("newWorld"):
+        print("# a new world, as the panel asked: the game makes one")
+        return 0
+    evidence = []
+    if seen.get("seen"):
+        evidence.append(f"this server ran it ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(seen['seen']))})")
+    names = backup_files()
+    if names:
+        evidence.append(f"{len(names)} backup(s)")
+    game_copies = sorted(f for f in (os.listdir(SAVED_DIR) if os.path.isdir(SAVED_DIR) else []) if GAME_BACKUP_RE.match(f))
+    if game_copies:
+        evidence.append(f"the game's own {', '.join(game_copies[:3])}")
+    if not evidence:
+        return 0
+    path = os.path.join(SAVED_DIR, WORLD_DB)
+    why = "missing" if not os.path.exists(path) else "unusable"
+    # Wait for Syncthing first. The backups are on the synced volume too and can arrive before
+    # game_0.db: putting one back at once would give the file a new time, and Syncthing could then
+    # send that OLDER world over the real one still on its way. Only a missing world waits.
+    if why == "missing" and WORLD_SYNC_GRACE > 0:
+        missing = read_json(WORLD_MISSING, {}) or {}
+        since = missing.get("since") if isinstance(missing, dict) else None
+        if not isinstance(since, (int, float)):
+            since = time.time()
+            write_json(WORLD_MISSING, {"since": since}, indent=None)
+        left = int(WORLD_SYNC_GRACE - (time.time() - since))
+        if left > 0:
+            print(f"The world is missing on this node, but this server had one ({'; '.join(evidence)}). "
+                  f"Waiting for it to sync before putting a backup back (about {max(1, (left + 59) // 60)} min).")
+            return 3
+    if os.path.exists(path):
+        aside = f"{path}.flux-unusable-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}"
+        try:
+            os.replace(path, aside)
+            print(f"# WARN game_0.db is unusable: kept as {os.path.basename(aside)}")
+        except OSError:
+            pass
+    for name in names:
+        staging = local_staging(".flux-restore-")
+        try:
+            with tarfile.open(os.path.join(BACKUP_DIR, name)) as t:
+                member = t.getmember(f"Saved/{WORLD_DB}")
+                t.extractall(staging, members=[member], filter="data")
+            src = os.path.join(staging, "Saved", WORLD_DB)
+            if not world_usable(src):
+                raise ValueError("its world is not a database")
+            put_world(src)
+        except (OSError, KeyError, tarfile.TarError, ValueError) as e:
+            print(f"# WARN the backup {name} could not be restored ({e}); trying an older one")
+            continue
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        mark_world_seen(os.path.join(SAVED_DIR, WORLD_DB))
+        clear_world_missing()
+        msg = (f"The world was {why} on this node ({'; '.join(evidence)}): "
+               f"restored the newest backup, {name}, instead of starting a new world")
+        print(f"# WARN {msg}")
+        data = read_json(STATE_FILE, {}) or {}
+        data["worldRestored"] = {"backup": name, "at": iso_now(), "reason": why}
+        write_json(STATE_FILE, data, indent=None)
+        return 0
+    print(f"The world is {why} on this node, but this server had one ({'; '.join(evidence)}) "
+          f"and no backup could be put back. Not starting a new world over it: waiting for it to sync. "
+          f"The panel's New world starts over instead.")
+    return 3
 
 
 # ------------------------------------------------------------------------------------------------
@@ -1192,6 +1586,111 @@ def cmd_update_skip(build):
     sys.exit(0 if recent else 1)
 
 
+# ------------------------------------------------------------------------------------------------
+# Workshop mod updates. Steam clients update a mod as soon as its author publishes, and a server
+# still on the old version refuses them (mod mismatch) until it restarts. The watcher asks Steam
+# for each listed mod's time_updated (the public Web API, no key) and compares it with the
+# timeupdated SteamCMD recorded when it downloaded the mod; a newer one is a restart (mods-sync
+# downloads it). A mod update that did not land is not retried for 6 hours, like a game update.
+# ------------------------------------------------------------------------------------------------
+
+def installed_mod_times():
+    """{id: timeupdated} from SteamCMD's appworkshop_440900.acf (WorkshopItemsInstalled)."""
+    try:
+        with open(WORKSHOP_ACF, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return {}
+    # The block's text, up to its closing brace (the file is Valve's KeyValues, nested braces).
+    start = text.find('"WorkshopItemsInstalled"')
+    start = text.find("{", start) if start >= 0 else -1
+    depth, end = 0, start
+    while 0 <= end < len(text):
+        depth += {"{": 1, "}": -1}.get(text[end], 0)
+        if depth == 0:
+            break
+        end += 1
+    block = text[start:end] if start >= 0 else ""
+    found = {}
+    for mid, body in re.findall(r'"(\d{6,12})"\s*\{([^{}]*)\}', block):
+        t = re.search(r'"timeupdated"\s+"(\d+)"', body)
+        if t:
+            found[mid] = int(t.group(1))
+    return found
+
+
+def remote_mod_times(ids, timeout=20):
+    """{id: time_updated} from Steam's GetPublishedFileDetails. Raises OSError / ValueError when
+    Steam cannot be asked; a mod Steam does not know (removed, private) is left out."""
+    import urllib.parse
+    import urllib.request
+    form = {"itemcount": str(len(ids))}
+    for i, mid in enumerate(ids):
+        form[f"publishedfileids[{i}]"] = mid
+    req = urllib.request.Request(WORKSHOP_API, data=urllib.parse.urlencode(form).encode(), method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        details = json.loads(resp.read().decode("utf-8", "replace"))["response"]["publishedfiledetails"]
+    return {str(d.get("publishedfileid")): int(d["time_updated"]) for d in details
+            if int(d.get("result", 0)) == 1 and str(d.get("time_updated", "")).isdigit()}
+
+
+def mods_needing_update(ids, remote, installed, failed, now):
+    """The listed mods Steam has a newer version of than the one installed, in list order. A mod
+    not installed at all is mods-sync's to fetch, not a restart. failed = {id: {"target", "at"}}:
+    the same version that already failed to land within UPDATE_FAILED_SKIP is left alone."""
+    wanted = []
+    for mid in ids:
+        if mid not in remote or mid not in installed or remote[mid] <= installed[mid]:
+            continue
+        f = failed.get(mid) or {}
+        if f.get("target") == remote[mid] and now - int(f.get("at") or 0) < UPDATE_FAILED_SKIP:
+            continue
+        wanted.append(mid)
+    return wanted
+
+
+def cmd_mods_update_check():
+    ids, _ = mods_state()
+    if not ids:
+        sys.exit(1)
+    try:
+        remote = remote_mod_times(ids)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"# WARN could not ask Steam about the mods ({e}); trying again later")
+        sys.exit(1)
+    failed = read_json(MOD_UPDATE_FAILED_FILE, {}) or {}
+    wanted = mods_needing_update(ids, remote, installed_mod_times(), failed, int(time.time()))
+    if not wanted:
+        sys.exit(1)
+    write_json(MOD_UPDATE_TARGET_FILE, {mid: remote[mid] for mid in wanted}, indent=None)
+    data = read_json(STATE_FILE, {}) or {}
+    data["modUpdateWaiting"] = wanted
+    write_json(STATE_FILE, data, indent=None)
+    print(" ".join(wanted))
+
+
+def mods_update_landed():
+    """After mods-sync: a mod update the restart was for that is still not installed is recorded,
+    so it is not retried for 6 hours."""
+    target = read_json(MOD_UPDATE_TARGET_FILE)
+    if not isinstance(target, dict):
+        return
+    try:
+        os.remove(MOD_UPDATE_TARGET_FILE)
+    except OSError:
+        pass
+    installed = installed_mod_times()
+    failed = read_json(MOD_UPDATE_FAILED_FILE, {}) or {}
+    now = int(time.time())
+    for mid, when in target.items():
+        if installed.get(mid, 0) < int(when):
+            failed[mid] = {"target": int(when), "at": now}
+            print(f"# WARN the update of mod {mid} did not install: not retried for 6 hours")
+        else:
+            failed.pop(mid, None)
+    write_json(MOD_UPDATE_FAILED_FILE, failed, indent=None)
+
+
 def main(argv):
     if not argv:
         print(__doc__, file=sys.stderr)
@@ -1207,6 +1706,7 @@ def main(argv):
         "checkpoint": (cmd_checkpoint, (0,)),
         "players": (cmd_players, (0,)),
         "bans": (cmd_bans, (0,)),
+        "unban": (cmd_unban, (1,)),
         "mods": (cmd_mods, (0,)),
         "set-mods": (cmd_set_mods, (1,)),
         "mods-failed": (cmd_mods_failed, (0,)),
@@ -1222,12 +1722,18 @@ def main(argv):
         "update-target": (cmd_update_target, (1,)),
         "update-check": (cmd_update_check, (0,)),
         "update-skip": (cmd_update_skip, (1,)),
+        "mods-update-check": (cmd_mods_update_check, (0,)),
+        "world-guard": (lambda: sys.exit(cmd_world_guard()), (0,)),
+        "world-seen": (cmd_world_seen, (0,)),
     }
     if cmd == "settings":
         cmd_settings(*rest)
         return 0
     if cmd == "rcon":
         cmd_rcon(*rest)
+        return 0
+    if cmd == "ban" and rest:
+        cmd_ban(*rest)
         return 0
     if cmd not in commands or len(rest) not in commands[cmd][1]:
         print(__doc__, file=sys.stderr)
