@@ -392,7 +392,7 @@ def cmd_set_settings(raw):
     pending = read_json(SETTINGS_PENDING, {}) or {}
     pending.update({str(k): str(v) for k, v in wanted.items()})
     write_json(SETTINGS_PENDING, pending, indent=None)
-    restarted = bool(game_pids()) and request_restart("requested: server settings")
+    restarted = bool(game_pids()) and restart_covers("requested: server settings")
     out({"ok": True, "pending": len(pending), "serverQuit": restarted, "appliesOn": "restart"})
 
 
@@ -493,7 +493,9 @@ def mods_state():
     state = read_json(MODS_FILE, {}) or {}
     ids = [i for i in state.get("mods", []) if WORKSHOP_ID_RE.match(str(i))]
     raw = os.environ.get("CONAN_MODS")
-    if raw is not None and raw.strip() != state.get("envSeen", ""):
+    # Compared as lists of ids, not as text: the hub writes the list back normalised ("1,2" for
+    # "1, 2"), and a text comparison would read that as a new deployment value and drop the mods added in the panel.
+    if raw is not None and parse_ids(raw) != parse_ids(state.get("envSeen", "")):
         ids = parse_ids(raw)
         state = {"mods": ids, "envSeen": raw.strip()}
         write_json(MODS_FILE, state)
@@ -901,12 +903,16 @@ def cmd_ban(steam_id, *reason):
 def cmd_unban(steam_id):
     if not STEAM_ID_RE.match(str(steam_id)):
         fail("not a SteamID64 (7656119 and 10 more digits)", 2)
+    was_pending = steam_id in pending_bans()
     write_pending_bans([i for i in pending_bans() if i != steam_id])
     if game_pids():
         try:
             rcon(f"unbanplayer {steam_id}")
         except RconError:
-            pass
+            # The ban is in the running game's memory: only the server can lift it. A ban that was just
+            # waiting for the next start is lifted by dropping it; anything else is not done.
+            if not was_pending:
+                fail("the server did not answer, so the ban was not lifted; try again in a minute", 1)
     else:
         lines = blacklist_lines()
         kept = [line for line in lines if listed_id(line) != steam_id]
@@ -1080,7 +1086,8 @@ def cmd_status():
         "modUpdateWaiting": state.get("modUpdateWaiting"),
         "failedMods": state.get("failedMods"),
         "restartPending": os.path.exists(RESTART_MARKER),
-        "pending": (read_json(RESTORE_FILE, {}) or {}).get("backup"),
+        "pending": (read_json(RESTORE_FILE, {}) or {}).get("backup") or (read_json(RESTORE_FILE, {}) or {}).get("action"),
+        "modsLoaded": len([i for i in ids if pak_files(i)]),
         "lastAction": state.get("lastAction"),
         "worldRestored": state.get("worldRestored"),
         "image": os.environ.get("FLUX_IMAGE_VERSION", "dev"),
@@ -1096,6 +1103,11 @@ def cmd_players_seen(count):
 # ------------------------------------------------------------------------------------------------
 # Restarts
 # ------------------------------------------------------------------------------------------------
+
+def restart_covers(reason):
+    """True when a restart will happen for this change: this call asked for it, or one is already on its way."""
+    return request_restart(reason) or os.path.exists(RESTART_MARKER)
+
 
 def request_restart(reason):
     if os.path.exists(RESTART_MARKER):
@@ -1272,7 +1284,7 @@ def cmd_restore(name):
     if not BACKUP_NAME_RE.match(str(name)) or not os.path.isfile(os.path.join(BACKUP_DIR, name)):
         fail("no such backup", 2)
     write_json(RESTORE_FILE, {"backup": name, "at": int(time.time())}, indent=None)
-    restarted = bool(game_pids()) and request_restart(f"requested: restore {name}")
+    restarted = bool(game_pids()) and restart_covers(f"requested: restore {name}")
     out({"ok": True, "backup": name, "serverQuit": restarted, "appliesOn": "restart"})
 
 
@@ -1280,7 +1292,7 @@ def cmd_new_world():
     """A fresh world on the next start: the database is moved out of the way (after a safety
     backup); settings, mods and the ini files stay."""
     write_json(RESTORE_FILE, {"action": "new-world", "at": int(time.time())}, indent=None)
-    restarted = bool(game_pids()) and request_restart("requested: a new world")
+    restarted = bool(game_pids()) and restart_covers("requested: a new world")
     out({"ok": True, "serverQuit": restarted, "appliesOn": "restart"})
 
 
@@ -1307,7 +1319,7 @@ def cmd_import_world(name):
         os.remove(path)
         fail("that file is not a Conan Exiles world: a world is game.db or game_0.db (an SQLite database)", 2)
     write_json(RESTORE_FILE, {"action": "import", "file": base, "at": int(time.time())}, indent=None)
-    restarted = bool(game_pids()) and request_restart(f"requested: import the world {base}")
+    restarted = bool(game_pids()) and restart_covers(f"requested: import the world {base}")
     out({"ok": True, "file": base, "serverQuit": restarted, "appliesOn": "restart"})
 
 
