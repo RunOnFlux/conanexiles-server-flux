@@ -392,13 +392,13 @@ check "unban with no server takes the line out of blacklist.txt" "76561198000000
 
 # With the game running and RCON down, an unban is NOT reported as done; and a restart already on its
 # way counts as the restart the change needs.
-cp "$(command -v sleep)" "${tmp}/fakegame"; "${tmp}/fakegame" 300 & fake=$!
+printf '#!/bin/sh\nsleep 300\n' >"${tmp}/fakegame"; chmod +x "${tmp}/fakegame"; "${tmp}/fakegame" & fake=$!   # a script: its process name is its file name, whatever sleep is (a multi-call binary on some systems)
 sleep 0.3
 check "unban with the game up and no RCON answer says it did not happen" "1" "$(status cx FLUX_GAME_COMM=fakegame unban 76561198000000007)"
 check "and a ban that was only waiting for the next start is lifted by dropping it" "0" "$(cx ban 76561198000000008 >/dev/null; status cx unban 76561198000000008)"
 rm -f "${tmp}/restart-marker"; : >"${tmp}/restart-marker"
 check "a settings change while a restart is on its way reports the server quits" "True" "$(cx FLUX_GAME_COMM=fakegame set-settings '{"ServerName": "x"}' | jget serverQuit)"
-rm -f "${tmp}/restart-marker"; kill "${fake}" 2>/dev/null; wait "${fake}" 2>/dev/null
+rm -f "${tmp}/restart-marker"; pkill -P "${fake}" 2>/dev/null; kill "${fake}" 2>/dev/null; wait "${fake}" 2>/dev/null
 rm -f "${data}/Saved/blacklist.txt"
 cx ban 76561198000000004 >/dev/null
 cx apply >/dev/null
