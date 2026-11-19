@@ -250,6 +250,15 @@ player_count() {
   cat /tmp/flux-players 2>/dev/null
 }
 
+# The longest warning mark, in seconds (0 when there is none).
+warn_lead_seconds() {
+  local m best=0
+  for m in ${FLUX_RESTART_WARN_MINUTES}; do
+    [[ "${m}" =~ ^[0-9]+$ ]] && [ "${m}" -gt "${best}" ] && best="${m}"
+  done
+  echo $((best * 60))
+}
+
 # Warns the players in chat at each of FLUX_RESTART_WARN_MINUTES before a planned restart, then
 # returns. An empty server is restarted at once.
 warn_and_wait() {
@@ -343,8 +352,12 @@ watcher() {
         exit 0
       fi
     fi
-    if [ -n "${next_restart}" ] && [ "${now}" -ge "${next_restart}" ]; then
+    # The warnings start one lead BEFORE the announced time, so the restart lands at that time with
+    # players online (15, 5 and 1 minute marks); an empty server waits for the time itself.
+    if [ -n "${next_restart}" ] && [ "${now}" -ge $((next_restart - $(warn_lead_seconds))) ]; then
       warn_and_wait "daily restart"
+      now="$(date -u +%s)"
+      [ "${now}" -lt "${next_restart}" ] && [ "$(player_count)" = "0" ] && sleep $((next_restart - now))
       request_restart "planned: the daily restart (${restart_at} ${TZ:-UTC})"
       exit 0
     fi

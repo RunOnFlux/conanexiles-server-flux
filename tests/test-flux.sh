@@ -140,6 +140,12 @@ check "the deployment's list" "111111" "$(jget mods.0.id <"${tmp}/mods")"
 check "set-mods takes the panel's order" "0" "$(status cx CONAN_MODS="111111, 222222" set-mods '["222222", "333333", "111111"]')"
 check "the panel's list stands while the deployment's is unchanged" "222222 333333 111111" "$(cx CONAN_MODS="111111, 222222" mods | python3 -c 'import json,sys;print(*[m["id"] for m in json.load(sys.stdin)["mods"]])')"
 check "a changed deployment list replaces it" "444444" "$(cx CONAN_MODS="444444" mods | python3 -c 'import json,sys;print(*[m["id"] for m in json.load(sys.stdin)["mods"]])')"
+# The hub writes CONAN_MODS back normalised: the same ids in other spelling are NOT a new deployment value
+# (a 1.0.2 state holds the raw text, which must also count as unchanged).
+cx CONAN_MODS="555555, 666666" mods >/dev/null
+cx CONAN_MODS="555555, 666666" set-mods '["666666", "555555", "777000"]' >/dev/null
+check "the same ids spelled differently keep the panel's list" "666666 555555 777000" "$(cx CONAN_MODS="555555,666666" mods | python3 -c 'import json,sys;print(*[m["id"] for m in json.load(sys.stdin)["mods"]])')"
+check "an upgrade from a 1.0.2 state (raw envSeen with spaces) keeps it too" "666666 555555 777000" "$(cx CONAN_MODS="555555 ,666666" mods | python3 -c 'import json,sys;print(*[m["id"] for m in json.load(sys.stdin)["mods"]])')"
 check "a bad ID is refused" "2" "$(status cx set-mods '["12; rm"]')"
 check "not a list is refused" "2" "$(status cx set-mods '{"a":1}')"
 mkdir -p "${server}/steamapps/workshop/content/440900/444444" "${server}/steamapps/workshop/content/440900/555555/sub"
@@ -383,6 +389,16 @@ check "and clears the queue" "1" "$(status test -e "${data}/flux/bans-pending.js
 check "the launch line is unchanged by it" "0" "$(grep -c 'blacklist' <(grep -v '^#' "${tmp}/args"))"
 cx unban 76561198000000009 >/dev/null
 check "unban with no server takes the line out of blacklist.txt" "76561198000000001 76561198000000003" "$(tr '\n' ' ' <"${data}/Saved/blacklist.txt" | sed 's/ $//')"
+
+# With the game running and RCON down, an unban is NOT reported as done; and a restart already on its
+# way counts as the restart the change needs.
+cp "$(command -v sleep)" "${tmp}/fakegame"; "${tmp}/fakegame" 300 & fake=$!
+sleep 0.3
+check "unban with the game up and no RCON answer says it did not happen" "1" "$(status cx FLUX_GAME_COMM=fakegame unban 76561198000000007)"
+check "and a ban that was only waiting for the next start is lifted by dropping it" "0" "$(cx ban 76561198000000008 >/dev/null; status cx unban 76561198000000008)"
+rm -f "${tmp}/restart-marker"; : >"${tmp}/restart-marker"
+check "a settings change while a restart is on its way reports the server quits" "True" "$(cx FLUX_GAME_COMM=fakegame set-settings '{"ServerName": "x"}' | jget serverQuit)"
+rm -f "${tmp}/restart-marker"; kill "${fake}" 2>/dev/null; wait "${fake}" 2>/dev/null
 rm -f "${data}/Saved/blacklist.txt"
 cx ban 76561198000000004 >/dev/null
 cx apply >/dev/null
